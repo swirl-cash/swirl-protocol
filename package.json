@@ -16,6 +16,7 @@
     "dev:extension": "npm run dev -w @swirl/extension --",
     "build": "npm run build -w @swirl/wallet && npm run build -w @swirl/poi && npm run build -w @swirl/relay && npm run build -w @swirl/indexer && npm run build -w @swirl/web && npm run build -w @swirl/extension",
     "start:indexer": "npm run start -w @swirl/indexer",
+    "pretest": "npm run build -w @swirl/wallet && npm run build -w @swirl/poi",
     "test": "npm run test -w @swirl/wallet && npm run test -w @swirl/contracts && npm run test -w @swirl/relay && npm run test -w @swirl/indexer && npm run test -w @swirl/poi",
     "test:wallet": "npm run test -w @swirl/wallet",
     "test:contracts": "npm run test -w @swirl/contracts",
