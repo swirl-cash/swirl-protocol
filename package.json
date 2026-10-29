@@ -1,0 +1,34 @@
+{
+  "name": "swirl-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": ["apps/web", "apps/extension", "packages/wallet", "packages/contracts", "packages/relay", "packages/indexer", "packages/poi"],
+  "overrides": {
+    "bfj": "9.1.4",
+    "lodash": "4.18.1",
+    "@ethersproject/providers": {
+      "ws": "8.22.0"
+    }
+  },
+  "scripts": {
+    "dev": "npm run dev -w @swirl/web --",
+    "dev:extension": "npm run dev -w @swirl/extension --",
+    "build": "npm run build -w @swirl/wallet && npm run build -w @swirl/poi && npm run build -w @swirl/relay && npm run build -w @swirl/indexer && npm run build -w @swirl/web && npm run build -w @swirl/extension",
+    "start:indexer": "npm run start -w @swirl/indexer",
+    "test": "npm run test -w @swirl/wallet && npm run test -w @swirl/contracts && npm run test -w @swirl/relay && npm run test -w @swirl/indexer && npm run test -w @swirl/poi",
+    "test:wallet": "npm run test -w @swirl/wallet",
+    "test:contracts": "npm run test -w @swirl/contracts",
+    "test:relay": "npm run test -w @swirl/relay",
+    "test:indexer": "npm run test -w @swirl/indexer",
+    "test:poi": "npm run test -w @swirl/poi",
+    "test:e2e": "node apps/web/scripts/verify-e2e.mjs",
+    "test:e2e:extension": "node apps/extension/scripts/verify-extension-e2e.mjs",
+    "test:e2e:poi": "node apps/extension/scripts/verify-poi-e2e.mjs",
+    "test:dapp:extension": "node apps/extension/scripts/verify-dapp.mjs",
+    "verify:ui": "node apps/web/scripts/verify-ui.mjs",
+    "verify:extension": "node apps/extension/scripts/verify-extension.mjs",
+    "compile": "npm run compile -w @swirl/contracts"
+  },
+  "engines": { "node": ">=20" }
+}

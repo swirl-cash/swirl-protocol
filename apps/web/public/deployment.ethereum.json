@@ -1,0 +1,49 @@
+{
+  "network": "ethereum",
+  "name": "Ethereum",
+  "chainId": 1,
+  "rpcUrl": "https://ethereum.reth.rs/rpc",
+  "deployer": "0x51872254046BF76BF71DC941896943293D45624F",
+  "treasury": "0x51872254046BF76BF71DC941896943293D45624F",
+  "verifier": "0x2b94163D110d0ed54C908Bd522673336a1F4b98A",
+  "poseidonT3": "0x65fe36eDD0F05C4e0e33cb057778049A0b63f228",
+  "poseidonT5": "0x7e92CE29f6c40e3C02558109bF6D4f52289298B4",
+  "feeBps": 25,
+  "treeDepth": 16,
+  "trustedSetup": "development-only-ethereum-mainnet-unaudited",
+  "assets": [
+    {
+      "symbol": "ETH",
+      "name": "ETH",
+      "kind": "native",
+      "decimals": 18,
+      "token": "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+      "vault": "0x4e0aAaD4a91d4a966ce795F10E51b281687C7c36",
+      "gateway": "0xeC6bcfbaE0c8BD11B128dD304A109335D2b8a22D"
+    },
+    {
+      "symbol": "USDC",
+      "name": "USDC",
+      "kind": "erc20",
+      "decimals": 6,
+      "token": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+      "vault": "0x4e0aAaD4a91d4a966ce795F10E51b281687C7c36",
+      "gateway": ""
+    },
+    {
+      "symbol": "USDT",
+      "name": "USDT",
+      "kind": "erc20",
+      "decimals": 6,
+      "token": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+      "vault": "0x4e0aAaD4a91d4a966ce795F10E51b281687C7c36",
+      "gateway": ""
+    }
+  ],
+  "relayerUrl": "https://relay.swirl.cash",
+  "indexerUrl": "https://indexer.swirl.cash",
+  "poiNodeUrl": "https://relay.swirl.cash/ppoi",
+  "poiListKey": "451a2614af0a17383020ad9095b5ea015afbc44830039c7e779df68f8b9d1ad8",
+  "relayerVault": "0x4e0aAaD4a91d4a966ce795F10E51b281687C7c36",
+  "vault": "0x4e0aAaD4a91d4a966ce795F10E51b281687C7c36"
+}

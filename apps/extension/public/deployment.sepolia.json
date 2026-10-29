@@ -1,0 +1,29 @@
+{
+  "network": "sepolia",
+  "name": "Sepolia Public Beta",
+  "chainId": 11155111,
+  "rpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+  "deployer": "0x51872254046BF76BF71DC941896943293D45624F",
+  "treasury": "0x51872254046BF76BF71DC941896943293D45624F",
+  "verifier": "0x61d07B172af4F74457791D61Dc505b3574A1E567",
+  "poseidonT3": "0xbB1fD5A8Eb87bBbCbE50de1dCe6E1c7cD652Ec28",
+  "poseidonT5": "0xf3a3f41C55de617930338A0bf5e96d5D011D973C",
+  "feeBps": 25,
+  "treeDepth": 16,
+  "trustedSetup": "development-only-sepolia-public-beta",
+  "assetMode": "sepolia-eth-only-no-monetary-value",
+  "assets": [
+    {
+      "symbol": "ETH",
+      "name": "Sepolia ETH",
+      "kind": "native",
+      "decimals": 18,
+      "token": "0xc1FF85b84480c78a5929ccb284B0aDD9991De69a",
+      "vault": "0xdc073Ad5a0AC10587801Be72FEd820c92395D8E7",
+      "gateway": "0xA96567cD625A00ac802136448B85E127dae9C879"
+    }
+  ],
+  "relayerVault": "0xdc073Ad5a0AC10587801Be72FEd820c92395D8E7",
+  "token": "0xc1FF85b84480c78a5929ccb284B0aDD9991De69a",
+  "vault": "0xdc073Ad5a0AC10587801Be72FEd820c92395D8E7"
+}

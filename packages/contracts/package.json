@@ -1,0 +1,27 @@
+{
+  "name": "@swirl/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:local": "hardhat run scripts/deploy-local.ts --network localhost",
+    "deploy:production": "hardhat run scripts/deploy-production.ts"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.4.0",
+    "poseidon-solidity": "^0.0.5"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^6.1.0",
+    "@swirl/poi": "0.1.0",
+    "@swirl/wallet": "0.1.0",
+    "@types/node": "^24.10.1",
+    "circomlib": "^2.0.5",
+    "circomlibjs": "^0.1.7",
+    "hardhat": "^2.26.3",
+    "snarkjs": "^0.7.5",
+    "typescript": "~5.9.3",
+    "ts-node": "^10.9.2"
+  }
+}

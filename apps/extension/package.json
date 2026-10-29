@@ -1,0 +1,33 @@
+{
+  "name": "@swirl/extension",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:sepolia": "vite --mode sepolia",
+    "build": "tsc -b && vite build",
+    "build:sepolia": "tsc -b && vite build --mode sepolia",
+    "verify": "node scripts/verify-extension.mjs"
+  },
+  "dependencies": {
+    "@swirl/wallet": "^0.1.0",
+    "ethers": "^6.15.0",
+    "lucide-react": "^0.562.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.24",
+    "@types/node": "^24.10.1",
+    "@types/qrcode": "^1.5.6",
+    "@types/react": "^19.2.3",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^5.1.1",
+    "playwright-core": "^1.64.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4",
+    "vite-plugin-node-polyfills": "^0.28.0"
+  }
+}
