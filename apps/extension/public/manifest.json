@@ -1,24 +1,24 @@
 {
   "manifest_version": 3,
   "name": "SWIRL Wallet",
-  "version": "0.6.0",
+  "version": "0.7.7",
   "description": "Private SWIRL wallet with Groth16 proofs, multiple EVM networks and user-approved dApp connections.",
   "permissions": ["storage"],
-  "host_permissions": ["https://*/*", "http://127.0.0.1/*", "http://localhost/*"],
+  "host_permissions": ["https://swirl.cash/*", "https://www.swirl.cash/*", "https://relay.swirl.cash/*", "http://127.0.0.1/*", "http://localhost/*"],
   "background": {
     "service_worker": "background.js",
     "type": "module"
   },
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*"],
+      "matches": ["https://swirl.cash/*", "https://www.swirl.cash/*", "http://127.0.0.1/*", "http://localhost/*"],
       "js": ["inpage.js"],
       "run_at": "document_start",
       "all_frames": true,
       "world": "MAIN"
     },
     {
-      "matches": ["http://*/*", "https://*/*"],
+      "matches": ["https://swirl.cash/*", "https://www.swirl.cash/*", "http://127.0.0.1/*", "http://localhost/*"],
       "js": ["content.js"],
       "run_at": "document_start",
       "all_frames": true,

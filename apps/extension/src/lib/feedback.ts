@@ -15,6 +15,9 @@ export function errorMessage(error: unknown): string {
   const text = String(raw);
   const lower = text.toLowerCase();
 
+  if (code === 'CONFIRMATION_PENDING') {
+    return 'Transaction submitted and awaiting confirmation. Do not retry; check the transaction hash or Activity first.';
+  }
   if (code === 'ACTION_REJECTED' || code === 4001 || code === '4001' || /user (rejected|denied)|rejected the request/.test(lower)) {
     return 'Request cancelled. No new transaction was submitted.';
   }

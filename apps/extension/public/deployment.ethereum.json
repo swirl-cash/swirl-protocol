@@ -2,7 +2,15 @@
   "network": "ethereum",
   "name": "Ethereum",
   "chainId": 1,
-  "rpcUrl": "https://ethereum.reth.rs/rpc",
+  "deploymentBlock": 26288691,
+  "rpcUrl": "https://ethereum-rpc.publicnode.com",
+  "rpcFallbackUrls": [
+    "https://ethereum.reth.rs/rpc",
+    "https://eth.drpc.org",
+    "https://ethereum-public.nodies.app",
+    "https://rpc.mevblocker.io",
+    "https://rpc.flashbots.net"
+  ],
   "deployer": "0x51872254046BF76BF71DC941896943293D45624F",
   "treasury": "0x51872254046BF76BF71DC941896943293D45624F",
   "verifier": "0x2b94163D110d0ed54C908Bd522673336a1F4b98A",

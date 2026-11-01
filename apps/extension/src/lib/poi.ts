@@ -4,6 +4,7 @@ import {
   type POIProofResult, type SwirlWallet,
 } from '@swirl/wallet';
 import type { AssetConfig, NetworkConfig } from './network';
+import { getPoiProvingAssets } from './proving-assets';
 import {
   ciphertextHash, poiClientFor,
   type PendingPOITransaction, type PrivateTransactionResult,
@@ -175,7 +176,7 @@ export async function submitPendingPOI(
       publicRecipient: BigInt(pending.payload.publicRecipient), token: BigInt(pending.token), chainId: BigInt(pending.chainId),
       firstLeafIndex: pending.firstLeafIndex, txidMerklePath: confirmed.path,
     },
-    assets: { wasm: './proving/swirl_poi.wasm', zkey: './proving/swirl_poi_final.zkey' },
+    assets: await getPoiProvingAssets(),
   });
   await client.submitProof(proof);
   const store = await readStore();

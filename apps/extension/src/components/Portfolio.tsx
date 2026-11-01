@@ -11,6 +11,7 @@ export type PortfolioEntry = {
   price: number;
   loaded: boolean;
   error?: string;
+  privateError?: string;
 };
 
 export function formatAssetAmount(amount: bigint, decimals: number): string {
@@ -35,7 +36,7 @@ export function PortfolioHome({ assets, entries, syncing, onRefresh, onOpen }: {
   onRefresh: () => void;
   onOpen: (bucket: Exclude<AssetBucket, 'home'>) => void;
 }) {
-  const unavailable = assets.some((asset) => entries[asset.token]?.error);
+  const unavailable = assets.some((asset) => entries[asset.token]?.error || entries[asset.token]?.privateError);
   return <div className="portfolio-home">
     <div className="portfolio-overview">
       <div className="card-topline"><span>TOTAL ESTIMATED VALUE</span><button className="icon-button small" onClick={onRefresh} disabled={syncing} aria-label="Refresh all assets"><RefreshCw className={syncing ? 'spin' : ''} size={15} /></button></div>
@@ -85,12 +86,13 @@ export function AssetCollection({ bucket, assets, entries, selectedSymbol, synci
         const entry = entries[asset.token];
         const amount = entry ? bucket === 'public' ? entry.publicAmount : entry.privateAmount : 0n;
         const selected = selectedSymbol === asset.symbol;
+        const syncError = bucket === 'public' ? entry?.error : entry?.privateError;
         return <button key={asset.token} className={`asset-list-row ${bucket === 'public' ? 'public-row' : ''} ${selected ? 'selected' : ''}`} onClick={() => onSelect(asset.symbol)} aria-pressed={selected}>
           <span className={`asset-token-icon ${asset.kind}`}>{asset.symbol.slice(0, 1)}</span>
           <span className="asset-token-copy"><strong>{asset.symbol}</strong><small>{asset.name}</small></span>
           <span className="asset-token-value">
-            <strong className={bucket === 'private' && selected ? 'private-balance' : ''}>{entry?.error ? 'Unavailable' : `${entry?.loaded ? formatAssetAmount(amount, asset.decimals) : '—'} ${asset.symbol}`}</strong>
-            <small>{entry?.error ? 'Sync failed' : entry?.loaded ? formatUsd(usdValue(amount, asset.decimals, entry.price)) : 'Loading…'}</small>
+            <strong className={bucket === 'private' && selected ? 'private-balance' : ''}>{syncError ? 'Unavailable' : `${entry?.loaded ? formatAssetAmount(amount, asset.decimals) : '—'} ${asset.symbol}`}</strong>
+            <small>{syncError ? 'Sync failed' : entry?.loaded ? formatUsd(usdValue(amount, asset.decimals, entry.price)) : 'Loading…'}</small>
           </span>
           <ChevronRight className="asset-row-chevron" size={14} />
         </button>;

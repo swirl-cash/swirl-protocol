@@ -13,7 +13,10 @@ export type NetworkConfig = {
   name: string;
   chainId: number;
   rpcUrl: string;
+  rpcFallbackUrl?: string;
+  rpcFallbackUrls?: string[];
   assets: AssetConfig[];
+  deploymentBlock?: number;
   feeBps: number;
   relayerUrl: string;
   relayerVault: string;
@@ -112,7 +115,9 @@ function validAsset(asset: AssetConfig): boolean {
     && (asset.kind === 'native' ? isAddress(asset.gateway) : asset.kind === 'erc20' && !asset.gateway));
 }
 export function poiRequired(config: NetworkConfig): boolean {
-  return config.chainId !== 31337 || Boolean(config.poiNodeUrl);
+  // PPOI is mandatory on Ethereum mainnet. Public testnets can synchronize and
+  // submit test transactions while their PPOI deployment is not enabled.
+  return config.chainId === 1 || Boolean(config.poiNodeUrl);
 }
 export function poiReady(config: NetworkConfig): boolean {
   return Boolean(config.poiNodeUrl && /^[0-9a-fA-F]{64}$/.test(config.poiListKey));
@@ -129,9 +134,12 @@ export function validateNetwork(config: NetworkConfig): void {
   if (!protocolReady(config) && config.assets.length) throw new Error('The packaged asset or PPOI deployment is incomplete or invalid');
   const tokens = config.assets.map((asset) => asset.token.toLowerCase());
   if (new Set(tokens).size !== tokens.length) throw new Error('Each asset must use a distinct token; assets may share a vault');
-  for (const [label, url, required] of [
-    ['RPC', config.rpcUrl, true], ['Relayer', config.relayerUrl, false], ['Indexer', config.indexerUrl, false], ['PPOI', config.poiNodeUrl, false],
-  ] as const) {
+  const endpoints: Array<readonly [label: string, url: string, required: boolean]> = [
+    ['RPC', config.rpcUrl, true], ['Fallback RPC', config.rpcFallbackUrl ?? '', false],
+    ...(config.rpcFallbackUrls ?? []).map((url, index) => [`Fallback RPC ${index + 2}`, url, false] as const),
+    ['Relayer', config.relayerUrl, false], ['Indexer', config.indexerUrl, false], ['PPOI', config.poiNodeUrl, false],
+  ];
+  for (const [label, url, required] of endpoints) {
     if (!url && !required) continue;
     try {
       const parsed = new URL(url);

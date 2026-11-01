@@ -1,5 +1,6 @@
-import { ethers, HDNodeWallet, JsonRpcProvider, NonceManager, type Signer } from 'ethers';
+import { ethers, HDNodeWallet, JsonRpcProvider, NonceManager, type Signer, type TransactionReceipt } from 'ethers';
 import type { NetworkConfig } from './network';
+import { createRpcProvider } from './rpc-provider';
 
 export const GAS_DERIVATION_PATH = "m/44'/60'/0'/1/0";
 export type GasOperation = 'transfer' | 'unshield';
@@ -29,8 +30,7 @@ export function gasAddress(mnemonic: string): string {
 }
 
 export function createProvider(config: NetworkConfig): JsonRpcProvider {
-  if (!config.rpcUrl) throw new Error('This network has no RPC connection');
-  return new JsonRpcProvider(config.rpcUrl, config.chainId, { staticNetwork: true });
+  return createRpcProvider(config);
 }
 
 export async function gasSnapshot(config: NetworkConfig, mnemonic: string): Promise<{
@@ -38,7 +38,11 @@ export async function gasSnapshot(config: NetworkConfig, mnemonic: string): Prom
 }> {
   const provider = createProvider(config);
   const address = gasAddress(mnemonic);
-  const [balance, feeData] = await Promise.all([provider.getBalance(address), provider.getFeeData()]);
+  // Bypass the provider's short-lived balance cache after a confirmed top-up.
+  const [rawBalance, feeData] = await Promise.all([
+    provider.send('eth_getBalance', [address, 'latest']), provider.getFeeData(),
+  ]);
+  const balance = BigInt(rawBalance);
   const feePerGas = feeData.maxFeePerGas ?? feeData.gasPrice;
   if (!feePerGas || feePerGas <= 0n) throw new Error('The RPC did not return a usable network fee');
   const estimates = (Object.keys(PLANNED_GAS_UNITS) as GasOperation[]).map((operation) => {
@@ -50,13 +54,14 @@ export async function gasSnapshot(config: NetworkConfig, mnemonic: string): Prom
 }
 
 export async function topUpGasAccount(input: {
-  config: NetworkConfig; mnemonic: string; amount: bigint;
-}): Promise<{ hash: string }> {
+  config: NetworkConfig; mnemonic: string; amount: bigint; onSubmitted?: (hash: string) => void;
+}): Promise<TransactionReceipt> {
   if (input.amount <= 0n) throw new Error('Enter a Gas amount greater than zero');
   const provider = createProvider(input.config);
   const signer = mainWallet(input.mnemonic, provider);
   const recipient = gasAddress(input.mnemonic);
   const transaction = await signer.sendTransaction({ to: recipient, value: input.amount });
+  input.onSubmitted?.(transaction.hash);
   const receipt = await transaction.wait();
   if (!receipt) throw new Error('Gas top-up receipt was not returned');
   return receipt;

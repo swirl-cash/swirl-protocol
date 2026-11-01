@@ -30,11 +30,16 @@ async function stop(child) {
 try {
   const manifest = JSON.parse(await readFile(path.join(extensionRoot, 'dist/manifest.json'), 'utf8'));
   if (manifest.manifest_version !== 3 || manifest.action?.default_popup !== 'index.html') throw new Error('Invalid MV3 popup manifest');
-  const expectedHosts = ['https://*/*', 'http://127.0.0.1/*', 'http://localhost/*'];
+  // relay.swirl.cash is required: the PPOI service only sends CORS headers for
+  // https://swirl.cash, and host permissions are the extension's CORS bypass.
+  const expectedHosts = ['https://swirl.cash/*', 'https://www.swirl.cash/*', 'https://relay.swirl.cash/*', 'http://127.0.0.1/*', 'http://localhost/*'];
+  const expectedContentScriptHosts = ['https://swirl.cash/*', 'https://www.swirl.cash/*', 'http://127.0.0.1/*', 'http://localhost/*'];
   if (JSON.stringify(manifest.permissions) !== JSON.stringify(['storage'])
     || JSON.stringify(manifest.host_permissions) !== JSON.stringify(expectedHosts)
     || manifest.background?.service_worker !== 'background.js' || manifest.background?.type !== 'module'
     || manifest.content_scripts?.length !== 2
+    || JSON.stringify(manifest.content_scripts[0].matches) !== JSON.stringify(expectedContentScriptHosts)
+    || JSON.stringify(manifest.content_scripts[1].matches) !== JSON.stringify(expectedContentScriptHosts)
     || manifest.content_scripts[0].js?.[0] !== 'inpage.js' || manifest.content_scripts[0].world !== 'MAIN'
     || manifest.content_scripts[1].js?.[0] !== 'content.js' || manifest.content_scripts[1].world !== 'ISOLATED') {
     throw new Error('Extension exceeds its declared network, storage or dApp bridge boundary');
@@ -42,7 +47,7 @@ try {
   for (const size of [16, 32, 48, 128]) await stat(path.join(extensionRoot, `dist/icons/icon-${size}.png`));
   for (const file of ['background.js', 'content.js', 'inpage.js', 'approval.html', 'approval.js']) await stat(path.join(extensionRoot, `dist/${file}`));
 
-  vite = spawn(process.execPath, [path.join(root, 'node_modules/vite/bin/vite.js'), '--host', '127.0.0.1', '--port', '7102', '--strictPort'], {
+  vite = spawn(process.execPath, [path.join(root, 'node_modules/vite/bin/vite.js'), 'preview', '--host', '127.0.0.1', '--port', '7102', '--strictPort'], {
     cwd: extensionRoot, env: process.env, stdio: ['ignore', 'pipe', 'pipe'],
   });
   await ready(vite, 'Local:');
@@ -58,6 +63,8 @@ try {
   await page.locator('#wallet-password').fill('correct horse battery');
   await page.locator('#wallet-confirmation').fill('correct horse battery');
   await page.getByRole('button', { name: 'Create encrypted wallet' }).click();
+  await page.locator('.backup-confirmation input').check();
+  await page.getByRole('button', { name: 'Continue to wallet' }).click();
   await page.getByText('Wallet unlocked', { exact: true }).waitFor({ timeout: 30_000 });
   const address = await page.locator('.account-address').getAttribute('title');
   if (!address?.startsWith('swirl1')) throw new Error('Wallet did not create a swirl1 address');
@@ -99,7 +106,15 @@ try {
   await page.getByText('Wallet unlocked', { exact: true }).waitFor({ timeout: 30_000 });
   if (await page.locator('.account-address').getAttribute('title') !== address) throw new Error('Unlock restored a different wallet');
   await page.reload({ waitUntil: 'networkidle' });
+  await page.getByText('Wallet unlocked', { exact: true }).waitFor({ timeout: 30_000 });
+  if (await page.locator('.account-address').getAttribute('title') !== address) throw new Error('Encrypted session restored a different wallet');
+  await page.getByRole('button', { name: 'Settings', exact: true }).click();
+  await page.locator('#preference-settings > summary').click();
+  if (await page.locator('#default-submission').inputValue() !== 'main') throw new Error('Default fee payer is not the user EVM wallet');
+  await page.getByRole('button', { name: 'Lock wallet' }).click();
   await page.getByRole('button', { name: 'Unlock wallet' }).waitFor();
+  const lockedSession = await page.evaluate(() => JSON.stringify(sessionStorage));
+  if (lockedSession.includes('swirl.unlocked-session.v1') || lockedSession.includes('swirl.wallet-view-session.v1')) throw new Error('Lock did not clear encrypted wallet sessions');
   if (errors.length) throw new Error(`Browser errors: ${errors.join(' | ')}`);
 
   const importContext = await browser.newContext({ viewport: { width: 440, height: 760 } });
@@ -111,6 +126,8 @@ try {
   await importPage.locator('#wallet-password').fill('import test password');
   await importPage.locator('#wallet-confirmation').fill('import test password');
   await importPage.getByRole('button', { name: 'Import encrypted wallet' }).click();
+  await importPage.locator('.backup-confirmation input').check();
+  await importPage.getByRole('button', { name: 'Continue to wallet' }).click();
   await importPage.getByText('Wallet unlocked', { exact: true }).waitFor({ timeout: 30_000 });
   const importedStorage = await importPage.evaluate(() => JSON.stringify(localStorage));
   if (importedStorage.includes(testPhrase)) throw new Error('Imported mnemonic was stored in plaintext');
@@ -133,6 +150,8 @@ try {
     await extensionPage.locator('#wallet-password').fill('native extension test');
     await extensionPage.locator('#wallet-confirmation').fill('native extension test');
     await extensionPage.getByRole('button', { name: 'Create encrypted wallet' }).click();
+    await extensionPage.locator('.backup-confirmation input').check();
+    await extensionPage.getByRole('button', { name: 'Continue to wallet' }).click();
     await extensionPage.getByText('Wallet unlocked', { exact: true }).waitFor({ timeout: 30_000 });
     const nativeStored = await extensionPage.evaluate(async () => JSON.stringify(await chrome.storage.local.get(null)));
     if (!nativeStored.includes('AES-256-GCM') || nativeStored.includes('mnemonic')) throw new Error('Native extension storage boundary failed');

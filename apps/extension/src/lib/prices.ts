@@ -1,15 +1,19 @@
 import { ethers } from 'ethers';
 import type { AssetConfig } from './network';
 
-const NATIVE_IDS: Record<number, string> = {
-  1: 'ethereum',
-  56: 'binancecoin',
-  137: 'polygon-ecosystem-token',
-  42161: 'ethereum',
-  11155111: 'ethereum',
-  80002: 'polygon-ecosystem-token',
-};
 const cache = new Map<number, { price: number; timestamp: number }>();
+const storageKey = (chainId: number) => `swirl.native-usd-price.${chainId}.v1`;
+
+function lastKnownPrice(chainId: number): number {
+  try {
+    const raw = localStorage.getItem(storageKey(chainId));
+    if (!raw) return 0;
+    const saved = JSON.parse(raw) as { price?: unknown; timestamp?: unknown };
+    if (typeof saved.price !== 'number' || !Number.isFinite(saved.price) || saved.price <= 0
+      || typeof saved.timestamp !== 'number' || Date.now() - saved.timestamp > 86_400_000) return 0;
+    return saved.price;
+  } catch { return 0; }
+}
 
 export async function assetUsdPrice(asset: AssetConfig | undefined, chainId: number): Promise<number> {
   if (!asset || chainId === 31337) return 0;
@@ -17,19 +21,22 @@ export async function assetUsdPrice(asset: AssetConfig | undefined, chainId: num
   if (asset.kind !== 'native') return 0;
   const cached = cache.get(chainId);
   if (cached && Date.now() - cached.timestamp < 300_000) return cached.price;
-  const id = NATIVE_IDS[chainId];
-  if (!id) return 0;
   try {
-    const response = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`, {
-      signal: AbortSignal.timeout(8_000), cache: 'no-store',
+    // Use the same multi-source price service as the web app instead of a
+    // browser-only third-party request that is intermittently blocked by CORS.
+    const response = await fetch(`https://swirl.cash/api/prices/native?chainId=${chainId}`, {
+      signal: AbortSignal.timeout(10_000), cache: 'no-store',
     });
-    if (!response.ok) return cached?.price ?? 0;
-    const data = await response.json() as Record<string, { usd?: unknown }>;
-    const price = data[id]?.usd;
-    if (typeof price !== 'number' || !Number.isFinite(price) || price < 0) return cached?.price ?? 0;
-    cache.set(chainId, { price, timestamp: Date.now() });
-    return price;
-  } catch { return cached?.price ?? 0; }
+    if (!response.ok) return cached?.price ?? lastKnownPrice(chainId);
+    const data = await response.json() as { price?: unknown };
+    if (typeof data.price !== 'number' || !Number.isFinite(data.price) || data.price <= 0) {
+      return cached?.price ?? lastKnownPrice(chainId);
+    }
+    const timestamp = Date.now();
+    cache.set(chainId, { price: data.price, timestamp });
+    try { localStorage.setItem(storageKey(chainId), JSON.stringify({ price: data.price, timestamp })); } catch { /* Storage is optional. */ }
+    return data.price;
+  } catch { return cached?.price ?? lastKnownPrice(chainId); }
 }
 
 export function usdValue(amount: bigint, decimals: number, price: number): number {

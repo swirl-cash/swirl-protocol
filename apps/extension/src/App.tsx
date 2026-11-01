@@ -14,13 +14,13 @@ import { createSwirlWallet, type SwirlWallet } from '@swirl/wallet';
 import { createEncryptedWallet, hasEncryptedWallet, unlockEncryptedWallet } from './lib/storage';
 import {
   DEFAULT_NETWORK, activateNetwork, loadNetwork, loadNetworks, protocolReady, rpcReady,
-  type NetworkConfig,
+  type AssetConfig, type NetworkConfig,
 } from './lib/network';
 import { addActivity, listActivity, type ActivityRecord } from './lib/activity';
 import { sendRuntimeMessage } from './lib/runtime';
 import {
   connectNetwork, estimatePrivateTransferRelayFee, getRelayFeeConfig, getRelayQuote, isNoteSpendable,
-  mintTestTokens, poiClientFor, privateTransfer, publicTransfer, shieldTokens, spendableNotes, syncNotes, unshieldTokens,
+  maximumNativeShieldAmount, mintTestTokens, poiClientFor, privateTransfer, publicTransfer, shieldTokens, spendableNotes, syncNotes, unshieldTokens, waitForTransactionReceipt,
   type OwnedNote, type PrivateTransactionResult, type RelayQuote, type SyncedNotes,
 } from './lib/protocol';
 import { retryPendingPOI, savePendingPOI, submitPendingPOI } from './lib/poi';
@@ -28,13 +28,41 @@ import { assetUsdPrice } from './lib/prices';
 import { assertGasAvailable, gasAddress, gasSnapshot, gasWallet, createProvider, nativeSymbol, topUpGasAccount, type GasEstimate } from './lib/gas';
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, type SubmissionPreference, type WalletSettings } from './lib/settings';
 import { errorMessage, transactionExplorer } from './lib/feedback';
+import { nextPendingPoiReviewAt, notePoiLabel } from './lib/poi-timing';
+import { getPoiProvingAssets, getTransferProvingAssets } from './lib/proving-assets';
+import { clearUnlockedSession, restoreUnlockedSession, restoreWalletViewSnapshot, saveUnlockedSession, saveWalletViewSnapshot } from './lib/session';
 
 type Mode = 'loading' | 'welcome' | 'create' | 'import' | 'unlock' | 'backup' | 'wallet';
 type WalletTab = 'assets' | 'receive' | 'activity' | 'settings';
 type Action = 'shield' | 'transfer' | 'unshield';
+type StoredPortfolioEntry = Omit<PortfolioEntry, 'publicAmount' | 'privateAmount'> & { publicAmount: string; privateAmount: string };
+type WalletViewSnapshot = { portfolio: Record<string, StoredPortfolioEntry>; activities: ActivityRecord[] };
+
+function parseWalletViewSnapshot(snapshot: WalletViewSnapshot | null) {
+  if (!snapshot || typeof snapshot !== 'object' || !snapshot.portfolio || typeof snapshot.portfolio !== 'object') return null;
+  try {
+    const portfolio = Object.fromEntries(Object.entries(snapshot.portfolio).map(([token, entry]) => {
+      if (typeof entry.publicAmount !== 'string' || typeof entry.privateAmount !== 'string'
+        || typeof entry.price !== 'number' || !Number.isFinite(entry.price) || typeof entry.loaded !== 'boolean') throw new Error('Invalid cached balance');
+      return [token, { ...entry, publicAmount: BigInt(entry.publicAmount), privateAmount: BigInt(entry.privateAmount) }];
+    })) as Record<string, PortfolioEntry>;
+    return { portfolio, activities: Array.isArray(snapshot.activities) ? snapshot.activities : [] };
+  } catch { return null; }
+}
 
 const emptySynced = (): SyncedNotes => ({ notes: [], tree: undefined as never });
 const short = (value: string, left = 10, right = 8) => `${value.slice(0, left)}…${value.slice(-right)}`;
+const noteSyncs = new Map<string, Promise<SyncedNotes>>();
+function sharedSyncNotes(config: NetworkConfig, asset: AssetConfig, wallet: SwirlWallet, connected: Awaited<ReturnType<typeof connectNetwork>>) {
+  const key = `${config.chainId}:${asset.vault.toLowerCase()}:${wallet.address}`;
+  let pending = noteSyncs.get(key);
+  if (!pending) {
+    pending = syncNotes(connected.vault, wallet, config.indexerUrl, poiClientFor(config, asset), config.deploymentBlock ?? 0);
+    noteSyncs.set(key, pending);
+    void pending.then(() => noteSyncs.delete(key), () => noteSyncs.delete(key));
+  }
+  return pending;
+}
 
 function Brand() {
   return <div className="brand"><img className="brand-logo" src="./icons/logo-mark.png" alt="" /><span>SWIRL <span className="brand-wallet">Wallet</span></span></div>;
@@ -73,6 +101,12 @@ export default function App() {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [transactionNotice, setTransactionNotice] = useState<{ notice: string; hash: string } | null>(null);
+  const [broadcastHash, setBroadcastHash] = useState('');
+  /* Notes with a broadcast-but-unconfirmed spend stay visible but disabled. */
+  const [pendingSpendLeaves, setPendingSpendLeaves] = useState<number[]>([]);
+  /* Only one note-spending transaction at a time: a second spend would reuse
+     the same unspent notes and revert on-chain, wasting Gas. */
+  const privateInFlight = useRef(false);
   const [busy, setBusy] = useState('');
   const [syncing, setSyncing] = useState(false);
   const [showPhrase, setShowPhrase] = useState(false);
@@ -105,6 +139,7 @@ export default function App() {
   const [gasError, setGasError] = useState('');
   const [showViewingKey, setShowViewingKey] = useState(false);
   const [lastActivity, setLastActivity] = useState(Date.now());
+  const [clock, setClock] = useState(Date.now());
   const qrRef = useRef<HTMLCanvasElement>(null);
   const refreshId = useRef(0);
   const portfolioRefreshId = useRef(0);
@@ -113,10 +148,26 @@ export default function App() {
   const poiRetrying = useRef(false);
   const busyRef = useRef(busy);
   busyRef.current = busy;
+  const portfolioEntriesRef = useRef(portfolioEntries);
+  portfolioEntriesRef.current = portfolioEntries;
 
   useEffect(() => {
-    void Promise.all([loadNetwork(), loadNetworks(), loadSettings(), hasEncryptedWallet()]).then(([network, catalog, preferences, exists]) => {
-      setConfig(network); setNetworks(catalog); setSettings(preferences); setWalletExists(exists); setMode(exists ? 'unlock' : 'welcome');
+    void Promise.all([loadNetwork(), loadNetworks(), loadSettings(), hasEncryptedWallet()]).then(async ([network, catalog, preferences, exists]) => {
+      setConfig(network); setNetworks(catalog); setSettings(preferences); setWalletExists(exists);
+      setAssetSymbol(network.assets[0]?.symbol ?? '');
+      const restored = await restoreUnlockedSession(network.chainId);
+      if (restored) {
+        const restoredAccount = HDNodeWallet.fromPhrase(restored.mnemonic).address;
+        const cached = parseWalletViewSnapshot(await restoreWalletViewSnapshot<WalletViewSnapshot>(network.chainId, restoredAccount));
+        if (cached) {
+          setPortfolioEntries(cached.portfolio); setActivities(cached.activities);
+          const firstAsset = network.assets[0];
+          setPublicBalance(firstAsset ? cached.portfolio[firstAsset.token]?.publicAmount ?? null : null);
+          setNotice('Wallet session restored. Balances restored; syncing latest…');
+        }
+        setWallet(restored); setMode('wallet'); setLastActivity(Date.now());
+        await notifyBackground('wallet:unlocked', restoredAccount);
+      } else setMode(exists ? 'unlock' : 'welcome');
     }).catch((cause) => {
       setError(errorMessage(cause)); setMode('welcome');
     });
@@ -135,7 +186,7 @@ export default function App() {
   const relayerFeeAction = settings.submission === 'relayer' && relayerSupported
     && ((action === 'transfer' && transferKind === 'private') || (action === 'unshield' && asset?.kind !== 'native'));
   const nativeCurrency = nativeSymbol(config.chainId);
-  const submissionLabel = settings.submission === 'relayer' ? 'Relayer' : settings.submission === 'gas' ? 'Gas account' : 'Main wallet';
+  const submissionLabel = settings.submission === 'relayer' ? 'Relayer' : settings.submission === 'gas' ? 'Gas account' : 'Your EVM wallet';
   const submissionExplanation = settings.submission === 'relayer'
     ? 'Relayer pays network Gas. You pay its quoted token fee from your private balance.'
     : settings.submission === 'gas'
@@ -143,6 +194,22 @@ export default function App() {
       : 'Your main EVM wallet pays network Gas directly. No Relayer fee is added.';
   const visibleNetworks = networks.filter((item) => item.chainId !== 31337 && (item.chainId === config.chainId || !settings.hiddenChainIds.includes(item.chainId)));
   const noticeTransactionUrl = transactionNotice?.notice === notice ? transactionExplorer(config.chainId, transactionNotice.hash) : '';
+  const hasPendingPoi = synced.notes.some((note) => !note.spent && note.poiStatus === 'ShieldPending');
+  const nextPoiReviewAt = nextPendingPoiReviewAt(synced.notes);
+
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(() => { setNotice(''); setTransactionNotice(null); }, 6000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+  useEffect(() => {
+    if (!error) return;
+    // Errors carrying a broadcast hash (confirmation timeout, on-chain revert) stay
+    // visible until the next action: they are the only place the hash is shown.
+    if (broadcastHash && error.includes(broadcastHash)) return;
+    const timer = window.setTimeout(() => setError(''), 9000);
+    return () => window.clearTimeout(timer);
+  }, [error, broadcastHash]);
 
   useEffect(() => {
     let active = true;
@@ -173,21 +240,41 @@ export default function App() {
     try {
       const connected = await connectNetwork(config, wallet, asset);
       const balanceRequest = asset.kind === 'native' ? connected.provider.getBalance(connected.account) : connected.token.balanceOf(connected.account);
-      const [nextNotes, balance, leaves, onChainDecimals, history] = await Promise.all([
-        syncNotes(connected.vault, wallet, config.indexerUrl, poiClientFor(config, asset)), balanceRequest,
-        connected.vault.nextLeafIndex(), connected.token.decimals(),
-        listActivity(config.chainId, connected.account, asset.token),
+      // Notes can take much longer than a balance read. Publish chain data first.
+      const notesRequest = sharedSyncNotes(config, asset, wallet, connected).then(
+        (value) => ({ value, error: null }), (error: unknown) => ({ value: null, error }),
+      );
+      const [balance, leaves, onChainDecimals, history] = await Promise.all([
+        balanceRequest, connected.vault.nextLeafIndex(), connected.token.decimals(),
+        listActivity(config.chainId, connected.account),
       ]);
       if (requestId !== refreshId.current) return;
       if (Number(onChainDecimals) !== asset.decimals) throw new Error(`${asset.symbol} decimals do not match the packaged deployment`);
-      const token = BigInt(asset.token);
-      const assetNotes = nextNotes.notes.filter((item) => item.note.token === token);
-      setSigner(connected.signer); setAccount(connected.account); setSynced({ ...nextNotes, notes: assetNotes }); setPublicBalance(balance);
+      setSigner(connected.signer); setAccount(connected.account); setPublicBalance(balance);
       setLeafCount(Number(leaves)); setTokenSymbol(asset.symbol); setDecimals(asset.decimals); setActivities(history);
-      setSelectedNote((current) => current ? assetNotes.find((item) => item.note.leafIndex === current.note.leafIndex && isNoteSpendable(item, Boolean(config.poiNodeUrl))) ?? null : null);
+      // Reconcile broadcasts that confirmed after their submission window closed
+      // (popup closed, or the confirmation wait elapsed before mining).
+      for (const item of history.filter((entry) => entry.status === 'pending')) {
+        void waitForTransactionReceipt({ hash: item.transactionHash, config, timeoutMs: 1 })
+          .then(async (receipt) => {
+            if (receipt.status !== 1) return;
+            await addActivity({ ...item, status: 'confirmed' });
+            if (requestId === refreshId.current) setActivities(await listActivity(config.chainId, item.account));
+          })
+          .catch(() => undefined);
+      }
+      const notesResult = await notesRequest;
+      if (requestId !== refreshId.current) return;
+      if (notesResult.value) {
+        const token = BigInt(asset.token);
+        const assetNotes = notesResult.value.notes.filter((item) => item.note.token === token);
+        setSynced({ ...notesResult.value, notes: assetNotes });
+        setSelectedNote((current) => current ? assetNotes.find((item) => item.note.leafIndex === current.note.leafIndex && isNoteSpendable(item, Boolean(config.poiNodeUrl))) ?? null : null);
+      } else setError(`Private note sync failed: ${errorMessage(notesResult.error)}`);
     } catch (cause) {
       if (requestId !== refreshId.current) return;
-      setSigner(null); setPublicBalance(null); setSynced(emptySynced()); setLeafCount(null); setError(errorMessage(cause));
+      // Keep the last confirmed view visible while reporting the synchronization error.
+      setError(errorMessage(cause));
     } finally { if (requestId === refreshId.current) setSyncing(false); }
   }, [asset, config, configReady, mode, wallet]);
 
@@ -200,42 +287,96 @@ export default function App() {
     }
     setPortfolioSyncing(true);
     const results = await Promise.all(config.assets.map(async (item) => {
+      const previous = portfolioEntriesRef.current[item.token];
       try {
         const connected = await connectNetwork(config, wallet, item);
         const balanceRequest = item.kind === 'native' ? connected.provider.getBalance(connected.account) : connected.token.balanceOf(connected.account);
-        const [nextNotes, balance, price, onChainDecimals] = await Promise.all([
-          syncNotes(connected.vault, wallet, config.indexerUrl, poiClientFor(config, item)), balanceRequest,
-          assetUsdPrice(item, config.chainId), connected.token.decimals(),
+        const notesRequest = sharedSyncNotes(config, item, wallet, connected).then(
+          (value) => ({ value, error: null }), (error: unknown) => ({ value: null, error }),
+        );
+        const priceRequest = assetUsdPrice(item, config.chainId).catch(() => previous?.price ?? 0);
+        const [balance, price, onChainDecimals] = await Promise.all([
+          balanceRequest, priceRequest, connected.token.decimals(),
         ]);
         if (Number(onChainDecimals) !== item.decimals) throw new Error(`${item.symbol} decimals do not match the packaged deployment`);
-        const availableNotes = nextNotes.notes.filter((note) => !note.spent && note.note.token === BigInt(item.token));
+        const publicEntry: PortfolioEntry = {
+          publicAmount: balance,
+          privateAmount: previous?.privateAmount ?? 0n,
+          noteCount: previous?.noteCount ?? 0,
+          price, loaded: true,
+        };
+        // Do not hide an already confirmed public balance behind private-note sync.
+        if (requestId === portfolioRefreshId.current) {
+          setPortfolioEntries((current) => ({ ...current, [item.token]: publicEntry }));
+        }
+        const notesResult = await notesRequest;
+        const availableNotes = notesResult.value?.notes.filter((note) => !note.spent && note.note.token === BigInt(item.token));
         const entry: PortfolioEntry = {
-          publicAmount: balance, privateAmount: availableNotes.reduce((sum, note) => sum + note.note.amount, 0n),
-          noteCount: availableNotes.length, price, loaded: true,
+          ...publicEntry,
+          privateAmount: availableNotes ? availableNotes.reduce((sum, note) => sum + note.note.amount, 0n) : previous?.privateAmount ?? 0n,
+          noteCount: availableNotes?.length ?? previous?.noteCount ?? 0,
+          ...(notesResult.error ? { privateError: `Private note sync failed: ${errorMessage(notesResult.error)}` } : {}),
         };
         return [item.token, entry] as const;
       } catch (cause) {
-        const entry: PortfolioEntry = { publicAmount: 0n, privateAmount: 0n, noteCount: 0, price: 0, loaded: false, error: errorMessage(cause) };
+        // Never replace a previously confirmed balance with zero because one
+        // auxiliary service (notes, price or RPC) is temporarily unavailable.
+        const entry: PortfolioEntry = previous
+          ? { ...previous, error: errorMessage(cause) }
+          : { publicAmount: 0n, privateAmount: 0n, noteCount: 0, price: 0, loaded: false, error: errorMessage(cause) };
         return [item.token, entry] as const;
       }
     }));
     if (requestId !== portfolioRefreshId.current) return;
-    setPortfolioEntries(Object.fromEntries(results)); setPortfolioSyncing(false);
+    const nextPortfolio = Object.fromEntries(results) as Record<string, PortfolioEntry>;
+    setPortfolioEntries(nextPortfolio);
+    try {
+      const activityAccount = HDNodeWallet.fromPhrase(wallet.mnemonic).address;
+      const history = await listActivity(config.chainId, activityAccount);
+      if (requestId !== portfolioRefreshId.current) return;
+      setActivities(history);
+      const snapshot: WalletViewSnapshot = {
+        portfolio: Object.fromEntries(Object.entries(nextPortfolio).map(([token, entry]) => [token, {
+          ...entry, publicAmount: entry.publicAmount.toString(), privateAmount: entry.privateAmount.toString(),
+        }])),
+        activities: history,
+      };
+      await saveWalletViewSnapshot(config.chainId, activityAccount, snapshot);
+    } catch { /* Cache failure must not hide live balances or activity. */ }
+    if (requestId === portfolioRefreshId.current) setPortfolioSyncing(false);
   }, [config, mode, wallet]);
   useEffect(() => { void refreshPortfolio(); }, [refreshPortfolio]);
+
+  useEffect(() => {
+    if (!hasPendingPoi) return;
+    setClock(Date.now());
+    const refreshPending = () => { if (!busyRef.current) void Promise.all([refresh(), refreshPortfolio()]); };
+    const clockTimer = window.setInterval(() => setClock(Date.now()), 1000);
+    const pollTimer = window.setInterval(refreshPending, 30_000);
+    const reviewTimer = nextPoiReviewAt === undefined ? undefined : window.setTimeout(
+      refreshPending, Math.max(0, nextPoiReviewAt - Date.now() + 2500),
+    );
+    return () => {
+      window.clearInterval(clockTimer); window.clearInterval(pollTimer);
+      if (reviewTimer !== undefined) window.clearTimeout(reviewTimer);
+    };
+  }, [hasPendingPoi, nextPoiReviewAt, refresh, refreshPortfolio]);
 
   useEffect(() => {
     if (!wallet || !asset || !config.poiNodeUrl || !configReady || mode !== 'wallet' || poiRetrying.current) return;
     let active = true;
     poiRetrying.current = true;
-    void retryPendingPOI(wallet, config, asset).then((result) => {
+    void retryPendingPOI(wallet, config, asset).then(async (result) => {
       if (!active) return;
-      if (result.completed > 0) setNotice(`${result.completed} confirmed transaction${result.completed === 1 ? '' : 's'} now have valid PPOI outputs.`);
+      if (result.completed > 0) {
+        await Promise.all([refresh(), refreshPortfolio()]);
+        if (active) setNotice(`${result.completed} confirmed transaction${result.completed === 1 ? '' : 's'} now have valid PPOI outputs.`);
+      }
       if (result.failed > 0) setError(`PPOI is still pending for ${result.failed} confirmed transaction${result.failed === 1 ? '' : 's'}: ${result.errors[0]}`);
     }).catch((cause) => { if (active) setError(`PPOI retry failed: ${errorMessage(cause)}`); })
       .finally(() => { poiRetrying.current = false; });
     return () => { active = false; };
-  }, [asset, config, configReady, mode, wallet]);
+  }, [asset, config, configReady, mode, refresh, refreshPortfolio, wallet]);
 
   const refreshGas = useCallback(async () => {
     if (!wallet || mode !== 'wallet' || !rpcReady(config)) return;
@@ -264,7 +405,7 @@ export default function App() {
       ? 'Relayer selected. It pays network Gas; the token fee is shown before submission.'
       : submission === 'gas'
         ? gasBalance !== null && gasBalance > 0n ? 'Gas account selected. It will pay network Gas for private transactions.' : `Gas account selected. Top it up with ${nativeCurrency} before private transactions.`
-        : 'Main wallet selected. It will pay network Gas directly; no Relayer fee is added.');
+        : 'Your EVM wallet selected. It will pay network Gas directly; no Relayer fee is added.');
   }
   function clearSensitiveForm() { setPassword(''); setConfirmation(''); setMnemonic(''); setError(''); }
   function changeMode(next: Mode) { clearSensitiveForm(); setNotice(''); setOverwriteConfirmed(false); setBackupConfirmed(false); setMode(next); }
@@ -279,6 +420,7 @@ export default function App() {
     setBusy('Securing wallet…'); setError('');
     try {
       const next = await createEncryptedWallet(password, importing ? mnemonic : undefined, config.chainId);
+      await saveUnlockedSession(next);
       setWallet(next); setWalletExists(true); clearSensitiveForm(); setBackupConfirmed(false); setMode('backup');
     } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(''); }
   }
@@ -286,6 +428,7 @@ export default function App() {
     if (!wallet || !backupConfirmed) return;
     setBusy('Opening wallet…'); setError('');
     try {
+      await saveUnlockedSession(wallet);
       await notifyBackground('wallet:unlocked', HDNodeWallet.fromPhrase(wallet.mnemonic).address);
       setMode('wallet'); setTab('assets'); setAssetView('home'); setLastActivity(Date.now());
       setNotice('Wallet ready. Your recovery phrase and private key remain available under Settings → Security & recovery.');
@@ -295,12 +438,14 @@ export default function App() {
     event.preventDefault(); setBusy('Decrypting…'); setError('');
     try {
       const next = await unlockEncryptedWallet(password, config.chainId);
+      await saveUnlockedSession(next);
       await notifyBackground('wallet:unlocked', HDNodeWallet.fromPhrase(next.mnemonic).address);
       setWallet(next); clearSensitiveForm(); setMode('wallet'); setAssetView('home'); setNotice(''); setLastActivity(Date.now());
     } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(''); }
   }
   function lock() {
     void notifyBackground('wallet:locked').catch(() => undefined);
+    void clearUnlockedSession().catch(() => undefined);
     setWallet(null); setSigner(null); setAccount(''); setSynced(emptySynced()); setPublicBalance(null);
     setPortfolioEntries({}); setAssetView('home'); setLegalDocument(null);
     setGasBalance(null); setGasEstimates([]); setGasError(''); setShowViewingKey(false);
@@ -339,7 +484,11 @@ export default function App() {
       const next = await activateNetwork(chainId);
       portfolioRefreshId.current += 1; setPortfolioEntries({});
       resetNetworkView(); setAssetSymbol(next.assets[0]?.symbol ?? ''); setConfig(next); setNetworks(await loadNetworks());
-      if (wallet && wallet.chainId !== next.chainId) setWallet(await createSwirlWallet(next.chainId, wallet.mnemonic));
+      if (wallet && wallet.chainId !== next.chainId) {
+        const switchedWallet = await createSwirlWallet(next.chainId, wallet.mnemonic);
+        await saveUnlockedSession(switchedWallet);
+        setWallet(switchedWallet);
+      }
       setNetworkOpen(false); setTab('assets'); setAssetView('home'); setLegalDocument(null);
       setNotice(protocolReady(next)
         ? `Switched to ${next.name}.`
@@ -363,11 +512,16 @@ export default function App() {
       if (transferKind === 'public') {
         maximum = publicBalance ?? 0n;
         if (asset.kind === 'native' && maximum > 0n) {
-          const feeData = await createProvider(config).getFeeData();
-          const unitFee = feeData.maxFeePerGas ?? feeData.gasPrice;
-          if (!unitFee || unitFee <= 0n) throw new Error('Network Gas price is unavailable');
-          const reserve = unitFee * 21_000n * 120n / 100n;
-          maximum = maximum > reserve ? maximum - reserve : 0n;
+          if (action === 'shield') {
+            if (!wallet || !signer) throw new Error('Sync the wallet before estimating Shield Gas');
+            maximum = await maximumNativeShieldAmount({ signer, config, asset, wallet, available: maximum });
+          } else {
+            const feeData = await createProvider(config).getFeeData();
+            const unitFee = feeData.maxFeePerGas ?? feeData.gasPrice;
+            if (!unitFee || unitFee <= 0n) throw new Error('Network Gas price is unavailable');
+            const reserve = unitFee * 21_000n * 120n / 100n;
+            maximum = maximum > reserve ? maximum - reserve : 0n;
+          }
         }
       } else {
         const spendable = spendableNotes(synced, BigInt(asset.token), Boolean(config.poiNodeUrl))
@@ -392,36 +546,66 @@ export default function App() {
   async function submitAction(event: FormEvent) {
     event.preventDefault();
     if (!wallet || !signer || !asset) return setError('Sync the configured network before submitting a transaction');
-    setBusy(action === 'shield' ? 'Confirming Shield…' : action === 'transfer' && transferKind === 'public' ? 'Sending public transfer…' : 'Generating Groth16 proof…'); setError(''); setNotice('');
+    const noteSpending = action === 'unshield' || (action === 'transfer' && transferKind === 'private');
+    if (noteSpending && privateInFlight.current) {
+      return setError('A private transaction is still confirming. Its hash is in Activity — wait for it before spending more notes.');
+    }
+    // Set synchronously before any await so a fast double-submit cannot slip past the guard.
+    if (noteSpending) privateInFlight.current = true;
+    setBusy(action === 'shield' ? 'Preparing Shield…' : action === 'transfer' && transferKind === 'public' ? 'Sending public transfer…' : 'Generating Groth16 proof…'); setError(''); setNotice(''); setBroadcastHash('');
     try {
       let receipt: PrivateTransactionResult['receipt'];
       let privateResult: PrivateTransactionResult | undefined;
       let activityAmount = amount;
+      const activityKind = action === 'transfer' && transferKind === 'public' ? 'public' : action;
       const privateAction = action === 'unshield' || (action === 'transfer' && transferKind === 'private');
       const submitDirectly = directSubmission || (action === 'unshield' && asset.kind === 'native');
       const useGasAccount = privateAction && submitDirectly && gasSubmission;
       const actionSigner = useGasAccount ? gasWallet(wallet.mnemonic, createProvider(config)) : signer;
       if (useGasAccount) await assertGasAvailable({ config, signer: actionSigner, operation: action === 'unshield' ? 'unshield' : 'transfer' });
+      if (privateAction) privateInFlight.current = true;
+      const submitted = (hash: string) => {
+        setBroadcastHash(hash);
+        const submittedNotice = `Transaction submitted ${short(hash, 8, 6)}. Waiting for ${config.name} confirmation — safe to close this window; the hash is saved in Activity.`;
+        setTransactionNotice({ notice: submittedNotice, hash }); setNotice(submittedNotice);
+        // Upstream wallets release the interface at broadcast and let confirmation
+        // resolve in the background; the pending record below is the durable state.
+        setBusy('');
+        if (action === 'unshield' && selectedNote) setPendingSpendLeaves((current) => [...current, selectedNote.note.leafIndex]);
+        void getTransferProvingAssets().catch(() => undefined);
+        if (config.poiNodeUrl) void getPoiProvingAssets().catch(() => undefined);
+        // Record the broadcast immediately: the hash survives a closed popup or a
+        // confirmation timeout, and confirmation updates this record in place.
+        void addActivity({ kind: activityKind, transactionHash: hash, amount: activityAmount, counterparty: recipient || undefined, chainId: config.chainId, account: account || evmAddress, assetToken: asset.token, assetSymbol: asset.symbol, status: 'pending' })
+          .then(() => listActivity(config.chainId, account || evmAddress)).then(setActivities).catch(() => undefined);
+      };
       if (action === 'shield') {
         const parsed = ethers.parseUnits(amount || '0', decimals);
         if (parsed <= 0n) throw new Error('Enter an amount greater than zero');
-        receipt = await shieldTokens({ signer, config, asset, wallet, grossAmount: parsed });
+        receipt = await shieldTokens({
+          signer, config, asset, wallet, grossAmount: parsed, onSubmitted: submitted,
+          onStage: (stage) => setBusy(stage === 'approving' ? 'Approving token…' : stage === 'estimating' ? 'Estimating network Gas…' : 'Broadcasting Shield…'),
+        });
       } else if (action === 'transfer') {
         const parsed = ethers.parseUnits(amount || '0', decimals);
         if (parsed <= 0n) throw new Error('Enter an amount greater than zero');
-        if (transferKind === 'public') receipt = await publicTransfer({ signer, config, asset, recipient, amount: parsed });
+        if (transferKind === 'public') receipt = await publicTransfer({ signer, config, asset, recipient, amount: parsed, onSubmitted: submitted });
         else {
-          privateResult = await privateTransfer({ signer: actionSigner, config, asset, wallet, synced, recipient, amount: parsed, directSubmission: submitDirectly });
+          privateResult = await privateTransfer({ signer: actionSigner, config, asset, wallet, synced, recipient, amount: parsed, directSubmission: submitDirectly, onSubmitted: submitted });
           receipt = privateResult.receipt;
         }
       } else {
         if (!selectedNote || !isNoteSpendable(selectedNote, Boolean(config.poiNodeUrl))) throw new Error('Select an unspent note with valid PPOI');
         activityAmount = ethers.formatUnits(selectedNote.note.amount, decimals);
-        privateResult = await unshieldTokens({ signer: actionSigner, config, asset, wallet, synced, note: selectedNote, recipient, directSubmission: submitDirectly });
+        privateResult = await unshieldTokens({
+          signer: actionSigner, config, asset, wallet, synced, note: selectedNote, recipient, directSubmission: submitDirectly, onSubmitted: submitted,
+          onStage: (stage) => setBusy(stage === 'resources' ? 'Loading prover resources…' : stage === 'proving' ? 'Generating Groth16 proof…' : stage === 'estimating' ? 'Estimating network Gas…' : 'Broadcasting Unshield…'),
+          onProgress: (progress) => setBusy(`Loading prover resources… ${progress}%`),
+        });
         receipt = privateResult.receipt;
       }
       if (!receipt) throw new Error('Transaction receipt was not returned. Check Activity and the network before retrying.');
-      if (receipt.status !== 1) throw new Error('The transaction was included but reverted. No new transaction was submitted; review the details before retrying.');
+      if (receipt.status !== 1) throw new Error(`The transaction ${receipt.hash} was included but reverted. No new transaction was submitted; review the details before retrying.`);
       let poiWarning = '';
       if (privateResult && config.poiNodeUrl) {
         setBusy('Submitting confirmed PPOI proof…');
@@ -432,19 +616,33 @@ export default function App() {
           poiWarning = ` PPOI is pending: ${errorMessage(cause)}. The transaction is already confirmed; do not submit it again.`;
         }
       }
-      const activityKind = action === 'transfer' && transferKind === 'public' ? 'public' : action;
       let activityWarning = '';
       try {
-        await addActivity({ kind: activityKind, transactionHash: receipt.hash, amount: activityAmount, counterparty: recipient || undefined, chainId: config.chainId, account, assetToken: asset.token, assetSymbol: asset.symbol });
+        await addActivity({ kind: activityKind, transactionHash: receipt.hash, amount: activityAmount, counterparty: recipient || undefined, chainId: config.chainId, account, assetToken: asset.token, assetSymbol: asset.symbol, status: 'confirmed' });
       } catch { activityWarning = ' Local activity could not be saved; keep the transaction hash for your records.'; }
+      // The confirmed inputs' nullifiers are spent on-chain. Hide those notes
+      // immediately instead of waiting for the background sync to catch up.
+      if (privateResult) {
+        const spentLeaves = new Set(privateResult.poi.inputs.map((spent) => spent.note.leafIndex));
+        setSynced((current) => ({ ...current, notes: current.notes.map((note) => spentLeaves.has(note.note.leafIndex) ? { ...note, spent: true } : note) }));
+      }
+      // The receipt and activity are already confirmed. Never hold the success
+      // state hostage to note indexing, PPOI or a background RPC refresh.
+      void Promise.all([refresh(), refreshGas(), refreshPortfolio()]).catch(() => undefined);
       const successNotice = (action === 'shield'
         ? 'Shield confirmed. Your encrypted note is now in the vault.'
         : action === 'transfer'
           ? transferKind === 'public' ? 'Public transfer confirmed.' : 'Private transfer confirmed. The input nullifiers are now spent.'
           : 'Unshield confirmed. Public assets were sent to the recipient.') + ` Amount: ${activityAmount} ${asset.symbol}.${poiWarning}${activityWarning}`;
-      setTransactionNotice({ notice: successNotice, hash: receipt.hash }); setNotice(successNotice);
-      setRecipient(''); setSelectedNote(null); await Promise.all([refresh(), refreshGas(), refreshPortfolio()]);
-    } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(''); }
+      // The receipt is already successful; post-confirmation sync errors must not replace success.
+      setError('');
+      setTransactionNotice({ notice: successNotice, hash: receipt.hash }); setNotice(successNotice); setBroadcastHash('');
+      setRecipient(''); setSelectedNote(null);
+    } catch (cause) { setError(errorMessage(cause)); } finally {
+      privateInFlight.current = false;
+      if (selectedNote) setPendingSpendLeaves((current) => current.filter((leaf) => leaf !== selectedNote.note.leafIndex));
+      setBusy('');
+    }
   }
   async function mint() {
     if (!signer || !asset) return;
@@ -454,9 +652,9 @@ export default function App() {
       const receipt = await mintTestTokens(signer, config, asset, value);
       if (!receipt || receipt.status !== 1) throw new Error('The mint transaction did not confirm successfully');
       await addActivity({ kind: 'mint', transactionHash: receipt.hash, amount: '10000', chainId: config.chainId, account, assetToken: asset.token, assetSymbol: asset.symbol });
+      void Promise.all([refresh(), refreshPortfolio()]).catch(() => undefined);
       const successNotice = `10,000 ${tokenSymbol} minted on the development chain.`;
-      setTransactionNotice({ notice: successNotice, hash: receipt.hash }); setNotice(successNotice);
-      await Promise.all([refresh(), refreshPortfolio()]);
+      setError(''); setTransactionNotice({ notice: successNotice, hash: receipt.hash }); setNotice(successNotice);
     } catch (cause) { setError(errorMessage(cause)); } finally { setBusy(''); }
   }
   async function topUpGas(event: FormEvent) {
@@ -466,11 +664,26 @@ export default function App() {
     try {
       const parsed = ethers.parseEther(gasAmount || '0');
       if (parsed <= 0n) throw new Error('Enter a Gas top-up amount greater than zero');
-      const receipt = await topUpGasAccount({ config, mnemonic: wallet.mnemonic, amount: parsed });
+      const receipt = await topUpGasAccount({
+        config, mnemonic: wallet.mnemonic, amount: parsed,
+        onSubmitted: (hash) => {
+          setBroadcastHash(hash);
+          const submittedNotice = `Gas top-up submitted ${short(hash, 8, 6)}. Waiting for ${config.name} confirmation — the hash is saved in Activity.`;
+          setTransactionNotice({ notice: submittedNotice, hash }); setNotice(submittedNotice);
+          setBusy('');
+          void addActivity({ kind: 'public', transactionHash: hash, amount: gasAmount, counterparty: dedicatedGasAddress, chainId: config.chainId, account, assetSymbol: nativeCurrency, status: 'pending' })
+            .then(() => listActivity(config.chainId, account)).then(setActivities).catch(() => undefined);
+        },
+      });
       if (!receipt) throw new Error('The Gas top-up did not return a transaction hash. Check the network before retrying.');
+      if (receipt.status !== 1) throw new Error('The Gas top-up reverted. Check the network before retrying.');
+      await addActivity({ kind: 'public', transactionHash: receipt.hash, amount: gasAmount, counterparty: dedicatedGasAddress, chainId: config.chainId, account, assetSymbol: nativeCurrency, status: 'confirmed' });
+      // The recipient balance increases by exactly the confirmed top-up amount.
+      // Show it now; the subsequent RPC read remains the source of truth.
+      setGasBalance((current) => (current ?? 0n) + parsed);
+      void Promise.all([refresh(), refreshGas(), refreshPortfolio()]).catch(() => undefined);
       const successNotice = `Gas account funded with ${gasAmount} ${nativeCurrency} · ${short(receipt.hash, 8, 6)}`;
-      setTransactionNotice({ notice: successNotice, hash: receipt.hash }); setNotice(successNotice);
-      await refreshGas();
+      setError(''); setTransactionNotice({ notice: successNotice, hash: receipt.hash }); setNotice(successNotice); setBroadcastHash('');
     } catch (cause) { setGasError(errorMessage(cause)); } finally { setBusy(''); }
   }
 
@@ -549,7 +762,7 @@ export default function App() {
       </section>
 
       {notice && <div className="message notice-message" role="status"><Check size={16} /><span>{notice}</span>{noticeTransactionUrl && <a href={noticeTransactionUrl} target="_blank" rel="noopener noreferrer">View transaction <ArrowUpRight size={12} /></a>}</div>}
-      {error && <div className="message error-message" role="alert"><CircleAlert size={16} /><span>{error}</span></div>}
+      {error && <div className="message error-message" role="alert"><CircleAlert size={16} /><span>{error}</span>{broadcastHash && error.includes(broadcastHash) && transactionExplorer(config.chainId, broadcastHash) && <a href={transactionExplorer(config.chainId, broadcastHash)} target="_blank" rel="noopener noreferrer">View transaction <ArrowUpRight size={12} /></a>}</div>}
 
       <div className="wallet-content">
         {tab === 'assets' && <section className="assets-view">
@@ -562,19 +775,19 @@ export default function App() {
             <form className="action-form" onSubmit={(event) => void submitAction(event)}>
               {action !== 'unshield' ? <>
                 <label className="field-label" htmlFor="action-amount">AMOUNT <span>{tokenSymbol || asset?.symbol}</span></label>
-                <div className="amount-input"><input id="action-amount" type="number" min="0" step="any" value={amount} onChange={(event) => { maxRequestId.current += 1; setAmount(event.target.value); }} required />{action === 'transfer' && <button type="button" className="max-button" aria-label="Use maximum transfer amount" onClick={() => void fillMaxTransfer()} disabled={Boolean(busy) || !signer}>MAX</button>}<span>{tokenSymbol || asset?.symbol}</span></div>
+                <div className="amount-input"><input id="action-amount" type="number" min="0" step="any" value={amount} onChange={(event) => { maxRequestId.current += 1; setAmount(event.target.value); }} required /><button type="button" className="max-button" aria-label={action === 'shield' ? 'Use maximum Shield amount' : 'Use maximum transfer amount'} onClick={() => void fillMaxTransfer()} disabled={Boolean(busy) || !signer}>MAX</button><span>{tokenSymbol || asset?.symbol}</span></div>
                 {action === 'shield' && <div className="fee-line"><span>Protocol fee · {(config.feeBps / 100).toFixed(2)}%</span><span>Net note: {amount ? (Number(amount) * (1 - config.feeBps / 10_000)).toLocaleString() : '0'} {tokenSymbol || asset?.symbol}</span></div>}
               </> : <>
                 <label className="field-label">SELECT AN UNSPENT NOTE</label>
                 {synced.poiError && <p className="error-message" role="alert">PPOI status unavailable: {synced.poiError}. Private spending is temporarily disabled.</p>}
                 <div className="note-list">{synced.notes.filter((item) => !item.spent).length === 0 && <div className="empty-notes">No unspent notes found.</div>}{synced.notes.filter((item) => !item.spent).map((item) => {
-                  const spendable = isNoteSpendable(item, Boolean(config.poiNodeUrl));
-                  const status = item.poiStatus?.replace('Shield', 'Shield ') ?? 'Unavailable';
-                  return <button type="button" key={item.note.leafIndex} disabled={!spendable} title={config.poiNodeUrl ? `PPOI: ${status}` : 'Unspent note'} className={`note-item ${selectedNote?.note.leafIndex === item.note.leafIndex ? 'chosen' : ''}`} onClick={() => setSelectedNote(item)}><span>Note #{item.note.leafIndex}{config.poiNodeUrl && <small> · PPOI {status}</small>}</span><strong>{ethers.formatUnits(item.note.amount, decimals)} {tokenSymbol}</strong></button>;
+                  const spendable = isNoteSpendable(item, Boolean(config.poiNodeUrl)) && !pendingSpendLeaves.includes(item.note.leafIndex);
+                  const status = pendingSpendLeaves.includes(item.note.leafIndex) ? 'Spend pending confirmation' : notePoiLabel(item, clock);
+                  return <button type="button" key={item.note.leafIndex} disabled={!spendable} title={config.poiNodeUrl || pendingSpendLeaves.includes(item.note.leafIndex) ? `PPOI: ${status}` : 'Unspent note'} className={`note-item ${selectedNote?.note.leafIndex === item.note.leafIndex ? 'chosen' : ''}`} onClick={() => setSelectedNote(item)}><span>Note #{item.note.leafIndex}<small> · {status}</small></span><strong>{ethers.formatUnits(item.note.amount, decimals)} {tokenSymbol}</strong></button>;
                 })}</div>
               </>}
               {action !== 'shield' && <><label className="field-label" htmlFor="action-recipient">{action === 'transfer' && transferKind === 'private' ? 'RECIPIENT SWIRL ADDRESS' : 'PUBLIC EVM RECIPIENT'}</label><input id="action-recipient" className="text-field" value={recipient} onChange={(event) => setRecipient(event.target.value)} placeholder={action === 'transfer' && transferKind === 'private' ? 'swirl1…' : '0x…'} spellCheck={false} required /></>}
-              {action !== 'shield' && (action !== 'transfer' || transferKind === 'private') && <div className="fee-select"><label className="field-label" htmlFor="gas-payer">NETWORK FEE</label><select id="gas-payer" className="text-field" value={settings.submission === 'relayer' && (!relayerSupported || (action === 'unshield' && asset?.kind === 'native')) ? 'main' : settings.submission} onChange={(event) => changeSubmission(event.target.value as SubmissionPreference)}>{relayerSupported && !(action === 'unshield' && asset?.kind === 'native') && <option value="relayer">Relayer</option>}<option value="main">Main wallet</option><option value="gas">Gas account · {gasBalance === null ? '—' : ethers.formatEther(gasBalance)} {nativeCurrency}</option></select><p className="submission-explainer">{submissionExplanation}</p></div>}
+              {action !== 'shield' && (action !== 'transfer' || transferKind === 'private') && <div className="fee-select"><label className="field-label" htmlFor="gas-payer">NETWORK FEE</label><select id="gas-payer" className="text-field" value={settings.submission === 'relayer' && (!relayerSupported || (action === 'unshield' && asset?.kind === 'native')) ? 'main' : settings.submission} onChange={(event) => changeSubmission(event.target.value as SubmissionPreference)}>{relayerSupported && !(action === 'unshield' && asset?.kind === 'native') && <option value="relayer">Relayer</option>}<option value="main">Your EVM wallet</option><option value="gas">Gas account · {gasBalance === null ? '—' : ethers.formatEther(gasBalance)} {nativeCurrency}</option></select><p className="submission-explainer">{submissionExplanation}</p></div>}
               {relayerFeeAction && <div className="fee-line relayer-fee-line"><span>Relayer fee</span><span>{relayQuote ? `${ethers.formatUnits(relayQuote.feeAmount, decimals)} ${tokenSymbol}` : relayQuoteError || 'Loading quote…'}</span></div>}
               <button className="primary-button" disabled={Boolean(busy) || syncing || !signer} type="submit">{busy ? <LoaderCircle className="spin" size={17} /> : action === 'shield' ? <ArrowDownToLine size={17} /> : <ArrowUpRight size={17} />}{busy || (action === 'shield' ? 'Shield assets' : action === 'transfer' ? transferKind === 'public' ? 'Send publicly' : 'Prove & transfer' : 'Prove & unshield')}<ChevronRight size={16} /></button>
               {!signer && <p className="action-hint">{configReady ? 'Sync the configured SWIRL contracts to enable private token transfers.' : 'SWIRL private contracts are not configured on this chain. Ordinary EVM dApps and transfers remain available.'}</p>}
@@ -592,7 +805,7 @@ export default function App() {
 
         {tab === 'activity' && <section className="activity-view">
           <div className="section-heading"><div><p className="eyebrow">ON THIS DEVICE</p><h2>Confirmed activity</h2></div><Activity size={20} /></div>
-          {activities.length === 0 ? <div className="empty-state"><Activity size={25} /><strong>No local activity yet</strong><span>Confirmed transactions submitted by this extension will appear here.</span></div> : <div className="activity-list">{activities.map((item) => <button className="activity-item" key={item.id} onClick={() => void copyValue(item.transactionHash)} title={`Copy transaction ${item.transactionHash}`}><span className={`activity-icon ${item.kind}`}>{item.kind === 'shield' || item.kind === 'mint' ? <ArrowDownToLine size={16} /> : <ArrowUpRight size={16} />}</span><span><strong>{item.kind === 'transfer' ? 'Private transfer' : item.kind === 'public' ? 'Public transfer' : item.kind[0].toUpperCase() + item.kind.slice(1)}</strong><small>{new Date(item.timestamp).toLocaleString()} · {short(item.transactionHash, 8, 6)}</small></span><b>{item.amount} {item.assetSymbol ?? tokenSymbol}</b></button>)}</div>}
+          {activities.length === 0 ? <div className="empty-state"><Activity size={25} /><strong>No local activity yet</strong><span>Confirmed transactions submitted by this extension will appear here.</span></div> : <div className="activity-list">{activities.map((item) => <button className="activity-item" key={item.id} onClick={() => void copyValue(item.transactionHash)} title={`Copy transaction ${item.transactionHash}`}><span className={`activity-icon ${item.kind}`}>{item.kind === 'shield' || item.kind === 'mint' ? <ArrowDownToLine size={16} /> : <ArrowUpRight size={16} />}</span><span><strong>{item.kind === 'transfer' ? 'Private transfer' : item.kind === 'public' ? 'Public transfer' : item.kind[0].toUpperCase() + item.kind.slice(1)}</strong><small>{item.status === 'pending' ? 'Pending · ' : ''}{new Date(item.timestamp).toLocaleString()} · {short(item.transactionHash, 8, 6)}</small></span><b>{item.amount} {item.assetSymbol ?? tokenSymbol}</b></button>)}</div>}
         </section>}
 
         {tab === 'settings' && <section className="settings-view">
@@ -616,7 +829,7 @@ export default function App() {
           </SettingsSection>
 
           <SettingsSection id="preference-settings" title="Wallet preferences" subtitle={`${submissionLabel} · auto-lock and synchronization`} icon={<Settings2 size={17} />}>
-            <div className="settings-row"><div><strong>Private transaction submission</strong><small>Default for Transfer and Unshield</small></div><select id="default-submission" aria-label="Default private transaction submission" className="text-field" value={settings.submission} onChange={(event) => changeSubmission(event.target.value as SubmissionPreference)}><option value="relayer">Relayer</option><option value="main">Main wallet</option><option value="gas">Gas account</option></select></div>
+            <div className="settings-row"><div><strong>Private transaction submission</strong><small>Default for Transfer and Unshield</small></div><select id="default-submission" aria-label="Default private transaction submission" className="text-field" value={settings.submission} onChange={(event) => changeSubmission(event.target.value as SubmissionPreference)}><option value="relayer">Relayer</option><option value="main">Your EVM wallet</option><option value="gas">Gas account</option></select></div>
             <p className="submission-explainer settings-submission-explainer">{submissionExplanation}</p>
             <div className="settings-row"><div><strong>Auto-lock</strong><small>After inactivity</small></div><select id="auto-lock-minutes" aria-label="Auto-lock timeout" className="text-field" value={settings.autoLockMinutes} onChange={(event) => { setLastActivity(Date.now()); updateSettings({ autoLockMinutes: Number(event.target.value) }); }}>{[1, 5, 15, 30].map((minutes) => <option key={minutes} value={minutes}>{minutes} minute{minutes === 1 ? '' : 's'}</option>)}<option value={0}>Never</option></select></div>
             <div className="settings-row"><div><strong>Sync wallet</strong><small>{leafCount ?? 0} tree leaves · {synced.notes.filter((note) => !note.spent).length} spendable notes</small></div><button id="settings-resync" className="secondary-button compact-button" onClick={() => void Promise.all([refresh(), refreshGas(), refreshPortfolio()])} disabled={syncing || Boolean(busy)}><RefreshCw className={syncing ? 'spin' : ''} size={14} />Sync now</button></div>

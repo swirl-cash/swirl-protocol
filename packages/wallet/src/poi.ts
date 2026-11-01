@@ -1,4 +1,5 @@
 import * as snarkjs from 'snarkjs';
+import { fullProve } from './full-prove-client.js';
 import { buildPoseidon } from 'circomlibjs';
 import { assertAmount, assertField, TREE_DEPTH } from './constants.js';
 import { verifyMerklePath, type MerklePath } from './merkle.js';
@@ -164,7 +165,7 @@ export async function createPOIProof(input: {
     txidPathIndices: tx.txidMerklePath.leafIndex,
     txidPathElements: tx.txidMerklePath.pathElements,
   };
-  const { proof, publicSignals } = await snarkjs.groth16.fullProve(witness, input.assets.wasm, input.assets.zkey);
+  const { proof, publicSignals } = await fullProve(witness, input.assets);
   return {
     proof,
     publicSignals,

@@ -1,4 +1,5 @@
 import * as snarkjs from 'snarkjs';
+import { fullProve } from './full-prove-client.js';
 import { assertAmount, assertField, TREE_DEPTH } from './constants.js';
 import { verifyMerklePath, type MerklePath } from './merkle.js';
 import { noteCommitment, noteNullifier, ownerFromSecret, zeroNote, type SwirlNote } from './notes.js';
@@ -122,7 +123,7 @@ export async function createTransferProof(input: {
     outputAmount: paddedOutputs.map((note) => note.amount),
     outputRandomness: paddedOutputs.map((note) => note.randomness),
   };
-  const { proof, publicSignals } = await snarkjs.groth16.fullProve(witness, input.assets.wasm, input.assets.zkey);
+  const { proof, publicSignals } = await fullProve(witness, input.assets);
   const raw = await snarkjs.groth16.exportSolidityCallData(proof, publicSignals);
   const [rawA, rawB, rawC] = JSON.parse(`[${raw}]`) as [SolidityProof['a'], SolidityProof['b'], SolidityProof['c']];
   const decimal = (value: string) => BigInt(value).toString(10);

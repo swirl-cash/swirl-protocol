@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from 'react';
 import { Check, FileSignature, Globe2, LoaderCircle, LockKeyhole, Send, ShieldCheck, WalletCards, X } from 'lucide-react';
-import { HDNodeWallet, JsonRpcProvider, NonceManager, ethers, type BigNumberish, type TransactionRequest } from 'ethers';
+import { HDNodeWallet, NonceManager, ethers, type BigNumberish, type TransactionRequest } from 'ethers';
+import { createRpcProvider } from './lib/rpc-provider';
 import { type SwirlWallet } from '@swirl/wallet';
 import { hasEncryptedWallet, unlockEncryptedWallet } from './lib/storage';
 import { activateNetwork, loadNetwork, loadNetworks, rpcReady } from './lib/network';
@@ -81,7 +82,7 @@ export default function ApprovalApp() {
       if (pending.method === 'wallet_switchEthereumChain') {
         const profile = (await loadNetworks()).find((item) => item.chainId === pending.chainId);
         if (!profile || !rpcReady(profile)) throw new Error('The requested network is not fully configured');
-        const provider = new JsonRpcProvider(profile.rpcUrl);
+        const provider = createRpcProvider(profile);
         const actual = await provider.getNetwork();
         if (Number(actual.chainId) !== pending.chainId) throw new Error(`RPC chain mismatch: expected ${pending.chainId}, received ${actual.chainId}`);
         await activateNetwork(pending.chainId);
@@ -99,7 +100,7 @@ export default function ApprovalApp() {
       if (active.chainId !== pending.chainId) throw new Error(`Switch SWIRL to ${chainName} before confirming this transaction`);
       if (!rpcReady(active)) throw new Error('The active network is not fully configured');
       if (transaction.from && (typeof transaction.from !== 'string' || transaction.from.toLowerCase() !== evm.address.toLowerCase())) throw new Error('The transaction sender does not match this wallet');
-      const provider = new JsonRpcProvider(active.rpcUrl);
+      const provider = createRpcProvider(active);
       const actual = await provider.getNetwork();
       if (Number(actual.chainId) !== pending.chainId) throw new Error(`RPC chain mismatch: expected ${pending.chainId}, received ${actual.chainId}`);
       const request: TransactionRequest = {

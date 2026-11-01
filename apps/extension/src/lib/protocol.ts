@@ -1,4 +1,4 @@
-import { Contract, ethers, HDNodeWallet, JsonRpcProvider, NonceManager, type Signer, type TransactionReceipt } from 'ethers';
+import { Contract, ethers, HDNodeWallet, JsonRpcProvider, NonceManager, type Provider, type Signer, type TransactionReceipt, type TransactionReceiptParams } from 'ethers';
 import {
   blindedCommitment, bytesToBigint, createNoteForAddress, createPreTransactionPOIProof,
   createTransferProof, decryptNote, encryptNote, hex32, noteCommitment, noteNullifier,
@@ -6,6 +6,8 @@ import {
   type POIProofResult, type POIStatus, type ProofInput, type SolidityProof, type SwirlNote, type SwirlWallet,
 } from '@swirl/wallet';
 import { validateNetwork, type AssetConfig, type NetworkConfig } from './network';
+import { getPoiProvingAssets, getTransferProvingAssets } from './proving-assets';
+import { createRpcProvider } from './rpc-provider';
 
 export type OwnedNote = {
   note: SwirlNote & { leafIndex: number };
@@ -13,7 +15,9 @@ export type OwnedNote = {
   nullifier: bigint;
   blindedCommitment: bigint;
   spent: boolean;
+  blockNumber: number;
   poiStatus?: POIStatus | 'Unavailable';
+  poiReviewAt?: number;
 };
 export type SyncedNotes = { notes: OwnedNote[]; tree: SwirlMerkleTree; poiError?: string };
 export type ProofPayload = {
@@ -174,15 +178,15 @@ export function contracts(signer: Signer, config: NetworkConfig, asset: AssetCon
 
 export async function connectNetwork(config: NetworkConfig, wallet: SwirlWallet, asset: AssetConfig) {
   validateNetwork(config);
-  const provider = new JsonRpcProvider(config.rpcUrl, config.chainId, { staticNetwork: true });
+  const provider = createRpcProvider(config);
   const network = await provider.getNetwork();
   if (network.chainId !== BigInt(config.chainId)) throw new Error(`RPC returned chain ${network.chainId}, expected ${config.chainId}`);
   const signer = new NonceManager(HDNodeWallet.fromPhrase(wallet.mnemonic).connect(provider));
   return { provider, signer, account: await signer.getAddress(), ...contracts(signer, config, asset) };
 }
 
-type ShieldRecord = { index: number; commitment: string; ciphertext: string };
-type TransferRecord = { first: number; commitments: string[]; ciphertexts: string[] };
+type ShieldRecord = { index: number; commitment: string; ciphertext: string; blockNumber: number };
+type TransferRecord = { first: number; commitments: string[]; ciphertexts: string[]; blockNumber: number };
 type EventRecords = { shields: ShieldRecord[]; transfers: TransferRecord[] };
 const isBytes32 = (value: unknown): value is string => typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value);
 const isHex = (value: unknown): value is string => typeof value === 'string' && /^0x(?:[0-9a-fA-F]{2})*$/.test(value);
@@ -215,44 +219,52 @@ async function recordsFromIndexer(vault: Contract, zeroCommitment: string, index
       || typeof event.transactionHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(event.transactionHash)
       || !isIndex(event.leafIndex)) throw new Error('Indexer returned invalid event metadata');
     if (event.kind === 'shield' && isBytes32(event.commitment) && isHex(event.ciphertext)) {
-      shields.push({ index: event.leafIndex, commitment: event.commitment, ciphertext: event.ciphertext });
+      shields.push({ index: event.leafIndex, commitment: event.commitment, ciphertext: event.ciphertext, blockNumber: event.blockNumber });
     } else if (event.kind === 'transacted' && Array.isArray(event.commitments) && event.commitments.length === 4
       && event.commitments.every(isBytes32) && Array.isArray(event.ciphertexts) && event.ciphertexts.length === 4
       && event.ciphertexts.every(isHex)) {
-      transfers.push({ first: event.leafIndex, commitments: event.commitments, ciphertexts: event.ciphertexts });
+      transfers.push({ first: event.leafIndex, commitments: event.commitments, ciphertexts: event.ciphertexts, blockNumber: event.blockNumber });
     } else throw new Error('Indexer returned an invalid event payload');
   }
   return { shields, transfers };
 }
 
-async function recordsFromRpc(vault: Contract): Promise<EventRecords> {
-  const [shieldEvents, transferEvents] = await Promise.all([
-    vault.queryFilter('Shielded', 0), vault.queryFilter('Transacted', 0),
-  ]);
+async function recordsFromRpc(vault: Contract, startBlock: number): Promise<EventRecords> {
+  const provider = vault.runner?.provider;
+  if (!provider) throw new Error('Vault provider is unavailable');
+  if (!Number.isSafeInteger(startBlock) || startBlock < 0) throw new Error('Invalid vault deployment block');
+  const latest = await provider.getBlockNumber();
   const shields: ShieldRecord[] = [];
   const transfers: TransferRecord[] = [];
-  for (const event of shieldEvents) {
-    if (!('args' in event)) continue;
-    shields.push({ index: Number(event.args[0]), commitment: event.args[1], ciphertext: event.args[2] });
-  }
-  for (const event of transferEvents) {
-    if (!('args' in event)) continue;
-    transfers.push({ first: Number(event.args[3]), commitments: [...event.args[1]], ciphertexts: [...event.args[2]] });
+  const batchSize = 500;
+  for (let start = startBlock; start <= latest; start += batchSize) {
+    const end = Math.min(start + batchSize - 1, latest);
+    // Public RPC providers reject whole-chain queries and small request bursts.
+    const shieldEvents = await vault.queryFilter('Shielded', start, end);
+    const transferEvents = await vault.queryFilter('Transacted', start, end);
+    for (const event of shieldEvents) {
+      if (!('args' in event) || event.removed) continue;
+      shields.push({ index: Number(event.args[0]), commitment: event.args[1], ciphertext: event.args[2], blockNumber: event.blockNumber });
+    }
+    for (const event of transferEvents) {
+      if (!('args' in event) || event.removed) continue;
+      transfers.push({ first: Number(event.args[3]), commitments: [...event.args[1]], ciphertexts: [...event.args[2]], blockNumber: event.blockNumber });
+    }
   }
   return { shields, transfers };
 }
 
 async function reconstructValidatedTree(vault: Contract, records: EventRecords, zeroCommitment: string) {
   const commitments: bigint[] = [BigInt(zeroCommitment)];
-  const encrypted: { index: number; ciphertext: string }[] = [];
+  const encrypted: { index: number; ciphertext: string; blockNumber: number }[] = [];
   for (const event of records.shields) {
     commitments[event.index] = BigInt(event.commitment);
-    encrypted.push({ index: event.index, ciphertext: event.ciphertext });
+    encrypted.push({ index: event.index, ciphertext: event.ciphertext, blockNumber: event.blockNumber });
   }
   for (const event of records.transfers) {
     for (let offset = 0; offset < 4; offset++) {
       commitments[event.first + offset] = BigInt(event.commitments[offset]);
-      encrypted.push({ index: event.first + offset, ciphertext: event.ciphertexts[offset] });
+      encrypted.push({ index: event.first + offset, ciphertext: event.ciphertexts[offset], blockNumber: event.blockNumber });
     }
   }
   if (Array.from({ length: commitments.length }, (_, index) => commitments[index]).some((value) => value === undefined)) {
@@ -263,14 +275,29 @@ async function reconstructValidatedTree(vault: Contract, records: EventRecords, 
   return { commitments, encrypted, tree };
 }
 
-export async function syncNotes(vault: Contract, wallet: SwirlWallet, indexerUrl: string, poiClient?: POINodeClient): Promise<SyncedNotes> {
+async function reconstructFromIndexer(vault: Contract, zeroCommitment: string, indexerUrl: string) {
+  // A just-confirmed transaction can be a few seconds ahead of the Indexer.
+  // Retry a root mismatch briefly instead of immediately scanning the whole chain.
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    try {
+      return await reconstructValidatedTree(vault, await recordsFromIndexer(vault, zeroCommitment, indexerUrl), zeroCommitment);
+    } catch (error) {
+      const rootMismatch = error instanceof Error && error.message === 'Reconstructed tree does not match the vault root';
+      if (!rootMismatch || attempt === 3) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 750 * (attempt + 1)));
+    }
+  }
+  throw new Error('Indexer history is unavailable');
+}
+
+export async function syncNotes(vault: Contract, wallet: SwirlWallet, indexerUrl: string, poiClient?: POINodeClient, startBlock = 0): Promise<SyncedNotes> {
   const zeroCommitment = await vault.zeroNoteCommitment();
   let reconstructed: Awaited<ReturnType<typeof reconstructValidatedTree>>;
   try {
-    reconstructed = await reconstructValidatedTree(vault, await recordsFromIndexer(vault, zeroCommitment, indexerUrl), zeroCommitment);
+    reconstructed = await reconstructFromIndexer(vault, zeroCommitment, indexerUrl);
   } catch (error) {
     if (indexerUrl) console.warn('Indexed history rejected; falling back to RPC event queries', error);
-    reconstructed = await reconstructValidatedTree(vault, await recordsFromRpc(vault), zeroCommitment);
+    reconstructed = await reconstructValidatedTree(vault, await recordsFromRpc(vault, startBlock), zeroCommitment);
   }
   const { encrypted, tree } = reconstructed;
   const ownerSecret = bytesToBigint(wallet.noteSecretKey);
@@ -286,7 +313,7 @@ export async function syncNotes(vault: Contract, wallet: SwirlWallet, indexerUrl
     ]);
     notes.push({
       note: { ...note, leafIndex: item.index }, commitment, nullifier, blindedCommitment: blinded,
-      spent: await vault.nullifiers(ethers.toBeHex(nullifier, 32)),
+      spent: await vault.nullifiers(ethers.toBeHex(nullifier, 32)), blockNumber: item.blockNumber,
     });
   }
   notes.sort((a, b) => a.note.leafIndex - b.note.leafIndex);
@@ -299,15 +326,37 @@ export async function syncNotes(vault: Contract, wallet: SwirlWallet, indexerUrl
       poiError = error instanceof Error ? error.message : String(error);
       for (const note of notes) note.poiStatus = 'Unavailable';
     }
+    const pendingBlocks = [...new Set(notes.filter((note) => note.poiStatus === 'ShieldPending').map((note) => note.blockNumber))];
+    if (pendingBlocks.length) {
+      try {
+        const provider = vault.runner?.provider;
+        if (!provider) throw new Error('Vault provider is unavailable');
+        const { chainId } = await provider.getNetwork();
+        const pendingSeconds = chainId === 1n ? 3600 : 60;
+        const timestamps = new Map<number, number>();
+        await Promise.all(pendingBlocks.map(async (blockNumber) => {
+          const block = await provider.getBlock(blockNumber);
+          if (!block) throw new Error(`Shield block ${blockNumber} is unavailable`);
+          timestamps.set(blockNumber, block.timestamp);
+        }));
+        for (const note of notes) {
+          const timestamp = timestamps.get(note.blockNumber);
+          if (note.poiStatus === 'ShieldPending' && timestamp !== undefined) note.poiReviewAt = (timestamp + pendingSeconds) * 1000;
+        }
+      } catch { /* Automatic PPOI refresh still works without an optional countdown. */ }
+    }
   }
   return { notes, tree, ...(poiError ? { poiError } : {}) };
 }
 
-function provingAssets() {
-  return { wasm: './proving/swirl_transfer.wasm', zkey: './proving/swirl_transfer_final.zkey' };
+function provingAssets(onProgress?: (progress: number) => void) {
+  return getTransferProvingAssets(onProgress);
 }
 
-async function submitProof(signer: Signer, config: NetworkConfig, asset: AssetConfig, payload: ProofPayload, directSubmission: boolean) {
+async function submitProof(
+  signer: Signer, config: NetworkConfig, asset: AssetConfig, payload: ProofPayload, directSubmission: boolean,
+  onSubmitted?: (hash: string) => void,
+) {
   if (config.relayerUrl && !directSubmission) {
     const response = await fetch(`${config.relayerUrl.replace(/\/$/, '')}/relay`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
@@ -315,7 +364,8 @@ async function submitProof(signer: Signer, config: NetworkConfig, asset: AssetCo
     const result = await response.json() as { transactionHash?: string; error?: string };
     if (!response.ok || !result.transactionHash) throw new Error(result.error || 'Relayer rejected the proof');
     if (!signer.provider) throw new Error('Provider unavailable');
-    return signer.provider.waitForTransaction(result.transactionHash);
+    onSubmitted?.(result.transactionHash);
+    return waitForTransactionReceipt({ hash: result.transactionHash, config, provider: signer.provider });
   }
   const { vault } = contracts(signer, config, asset);
   const args = [
@@ -333,10 +383,169 @@ async function submitProof(signer: Signer, config: NetworkConfig, asset: AssetCo
     throw new Error(`Vault preflight failed: ${details.shortMessage ?? details.message ?? String(error)}; revert data: ${typeof data === 'string' ? data : JSON.stringify(data)}`);
   }
   const transaction = await vault.transact(...args);
-  return transaction.wait();
+  onSubmitted?.(transaction.hash);
+  return waitForTransactionReceipt({ hash: transaction.hash, config, provider: signer.provider ?? undefined });
 }
 
-export async function shieldTokens(input: { signer: Signer; config: NetworkConfig; asset: AssetConfig; wallet: SwirlWallet; grossAmount: bigint }) {
+type ShieldStage = 'approving' | 'estimating' | 'broadcasting';
+type PopulatedShield = { to?: string; data?: string; value?: bigint };
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/* Broadcast acceptance and receipt availability are independent. Never rely on
+   the receiving node alone when it may lag behind its peers. */
+export async function waitForTransactionReceipt(input: {
+  hash: string; config: NetworkConfig; provider?: Provider; acceptedRpcUrl?: string; timeoutMs?: number;
+}): Promise<TransactionReceipt> {
+  const rpcUrls = [...new Set([
+    input.acceptedRpcUrl, input.config.rpcUrl, input.config.rpcFallbackUrl, ...(input.config.rpcFallbackUrls ?? []),
+  ].filter((url): url is string => Boolean(url)))];
+  if (!rpcUrls.length) throw new Error('No RPC is available to confirm the submitted transaction');
+  const providers = new Map<string, Provider>();
+  if (input.provider) providers.set(input.config.rpcUrl, input.provider);
+  const providerFor = (url: string) => {
+    let provider = providers.get(url);
+    if (!provider) {
+      provider = new JsonRpcProvider(url, input.config.chainId, { staticNetwork: true });
+      providers.set(url, provider);
+    }
+    return provider;
+  };
+  // Mainnet blocks arrive every ~12s, and low-fee transactions can wait several
+  // minutes for block space. 90 seconds is too short and trains users to retry,
+  // which is the one thing they must never do with a broadcast transaction.
+  const deadline = Date.now() + (input.timeoutMs ?? 600_000);
+  try {
+    while (true) {
+      const receipts = await Promise.all(rpcUrls.map(async (url): Promise<TransactionReceipt | null> => {
+        try {
+          // Bypass Provider receipt caching and use a hard network timeout for every endpoint.
+          const response = await fetch(url, {
+            method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_getTransactionReceipt', params: [input.hash] }),
+            signal: AbortSignal.timeout(8_000),
+          });
+          const body = await response.json() as { result?: unknown; error?: { message?: string } };
+          if (!response.ok || body.error) throw new Error(body.error?.message ?? `RPC returned HTTP ${response.status}`);
+          if (!body.result) return null;
+          const provider = providerFor(url);
+          return (provider as JsonRpcProvider)._wrapTransactionReceipt(body.result as TransactionReceiptParams, await provider.getNetwork());
+        } catch { return null; }
+      }));
+      const receipt = receipts.find((item): item is TransactionReceipt => Boolean(item));
+      if (receipt) return receipt;
+      if (Date.now() >= deadline) {
+        const error = new Error(`Transaction ${input.hash} was submitted, but confirmation is still pending. Do not retry; check the transaction hash or Activity first.`) as Error & { code: string };
+        error.code = 'CONFIRMATION_PENDING';
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2_500));
+    }
+  } finally {
+    for (const [url, provider] of providers) {
+      if (provider !== input.provider || url !== input.config.rpcUrl) provider.destroy();
+    }
+  }
+}
+
+async function submitNativeTransaction(input: {
+  signer: Signer; config: NetworkConfig; populated: PopulatedShield; action: 'Shield' | 'Unshield';
+  onStage?: (stage: 'estimating' | 'broadcasting') => void; onSubmitted?: (hash: string) => void;
+}): Promise<TransactionReceipt | null> {
+  const provider = input.signer.provider;
+  if (!provider) throw new Error('RPC provider is not connected');
+  const account = await input.signer.getAddress();
+  input.onStage?.('estimating');
+  const gasLimit = await withTimeout(
+    provider.estimateGas({ ...input.populated, from: account }), 20_000,
+    'Gas estimation timed out before broadcasting. No transaction was sent; check the RPC connection and try again.',
+  );
+  const [nonce, feeData] = await Promise.all([
+    withTimeout(input.signer.getNonce('pending'), 20_000, 'Nonce request timed out before signing'),
+    withTimeout(provider.getFeeData(), 20_000, 'Network fee request timed out before signing'),
+  ]);
+  const transaction: Parameters<Signer['signTransaction']>[0] = {
+    ...input.populated, gasLimit, nonce, chainId: input.config.chainId,
+  };
+  if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+    transaction.maxFeePerGas = feeData.maxFeePerGas;
+    transaction.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+  } else {
+    transaction.gasPrice = feeData.gasPrice;
+  }
+  input.onStage?.('broadcasting');
+  const signed = await input.signer.signTransaction(transaction);
+  const hash = ethers.keccak256(signed);
+  const rpcUrls = [...new Set([input.config.rpcUrl, input.config.rpcFallbackUrl, ...(input.config.rpcFallbackUrls ?? [])].filter((url): url is string => Boolean(url)))];
+  const errors: string[] = [];
+  let acceptedUrl = '';
+  for (const url of rpcUrls) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [signed] }),
+        signal: AbortSignal.timeout(12_000),
+      });
+      const body = await response.json() as { result?: string; error?: { message?: string } };
+      const rpcError = body.error?.message ?? '';
+      if (/already known|known transaction|already exists/i.test(rpcError)) {
+        acceptedUrl = url;
+        break;
+      }
+      if (!response.ok || body.error) throw new Error(rpcError || `RPC returned HTTP ${response.status}`);
+      if (body.result?.toLowerCase() !== hash.toLowerCase()) throw new Error('RPC returned a different transaction hash');
+      acceptedUrl = url;
+      break;
+    } catch (error) {
+      errors.push(`${new URL(url).hostname}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 220));
+    }
+  }
+  if (!acceptedUrl) throw new Error(`${input.action} could not be broadcast through the configured RPCs. ${errors.join(' | ')}`);
+  input.onSubmitted?.(hash);
+  return waitForTransactionReceipt({ hash, config: input.config, provider, acceptedRpcUrl: acceptedUrl });
+}
+
+export async function maximumNativeShieldAmount(input: {
+  signer: Signer; config: NetworkConfig; asset: AssetConfig; wallet: SwirlWallet; available: bigint;
+}): Promise<bigint> {
+  if (input.available <= 0n) return 0n;
+  const { gateway } = contracts(input.signer, input.config, input.asset);
+  if (!gateway) throw new Error('Native gateway is not configured');
+  const provider = input.signer.provider;
+  if (!provider) throw new Error('RPC provider is not connected');
+  // Estimate a real Shield call without broadcasting. A one-wei value keeps
+  // the estimate valid while the actual amount remains entirely local.
+  const note = await createNoteForAddress({
+    address: input.wallet.address, token: BigInt(input.asset.token), amount: 1n, chainId: input.config.chainId,
+  });
+  const commitment = await noteCommitment(note);
+  const ciphertext = ethers.hexlify(encryptNote(note, input.wallet.address));
+  const populated = await gateway.shieldNative.populateTransaction(
+    ethers.toBeHex(commitment, 32), ciphertext,
+    ethers.toBeHex(note.owner, 32), ethers.toBeHex(note.randomness, 32), { value: 1n },
+  );
+  const [from, feeData] = await Promise.all([input.signer.getAddress(), provider.getFeeData()]);
+  const gasUnits = await provider.estimateGas({ ...populated, from });
+  const unitFee = feeData.maxFeePerGas ?? feeData.gasPrice;
+  if (!unitFee || unitFee <= 0n) throw new Error('Network Gas price is unavailable');
+  const reserve = gasUnits * unitFee * 120n / 100n;
+  return input.available > reserve ? input.available - reserve : 0n;
+}
+
+export async function shieldTokens(input: {
+  signer: Signer; config: NetworkConfig; asset: AssetConfig; wallet: SwirlWallet; grossAmount: bigint;
+  onStage?: (stage: ShieldStage) => void; onSubmitted?: (hash: string) => void;
+}) {
   const { vault, token, gateway } = contracts(input.signer, input.config, input.asset);
   const fee = input.grossAmount * BigInt(input.config.feeBps) / 10_000n;
   const note = await createNoteForAddress({
@@ -344,23 +553,81 @@ export async function shieldTokens(input: { signer: Signer; config: NetworkConfi
   });
   const commitment = await noteCommitment(note);
   const ciphertext = ethers.hexlify(encryptNote(note, input.wallet.address));
+  const provider = input.signer.provider;
+  if (!provider) throw new Error('RPC provider is not connected');
+  const estimateGas = async (transaction: PopulatedShield) => {
+    input.onStage?.('estimating');
+    const from = await input.signer.getAddress();
+    return withTimeout(
+      provider.estimateGas({ ...transaction, from }),
+      20_000,
+      'Gas estimation timed out before broadcasting. No transaction was sent; check the RPC connection and try again.',
+    );
+  };
+  const signAndBroadcast = async (populated: PopulatedShield, gasLimit: bigint) => {
+    const account = await input.signer.getAddress();
+    const [nonce, feeData] = await Promise.all([
+      withTimeout(input.signer.getNonce('pending'), 20_000, 'Nonce request timed out before signing'),
+      withTimeout(provider.getFeeData(), 20_000, 'Network fee request timed out before signing'),
+    ]);
+    const transaction: Parameters<Signer['signTransaction']>[0] = {
+      ...populated, gasLimit, nonce, chainId: input.config.chainId,
+    };
+    if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+      transaction.maxFeePerGas = feeData.maxFeePerGas;
+      transaction.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
+    } else {
+      transaction.gasPrice = feeData.gasPrice;
+    }
+    input.onStage?.('broadcasting');
+    const signed = await input.signer.signTransaction(transaction);
+    const hash = ethers.keccak256(signed);
+    const rpcUrls = [...new Set([input.config.rpcUrl, input.config.rpcFallbackUrl, ...(input.config.rpcFallbackUrls ?? [])].filter((url): url is string => Boolean(url)))];
+    const errors: string[] = [];
+    let acceptedUrl = '';
+    for (const url of rpcUrls) {
+      try {
+        const response = await fetch(url, {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_sendRawTransaction', params: [signed] }),
+          signal: AbortSignal.timeout(12_000),
+        });
+        const body = await response.json() as { result?: string; error?: { message?: string } };
+        const rpcError = body.error?.message ?? '';
+        if (/already known|known transaction|already exists/i.test(rpcError)) {
+          acceptedUrl = url;
+          break;
+        }
+        if (!response.ok || body.error) throw new Error(rpcError || `RPC returned HTTP ${response.status}`);
+        if (body.result?.toLowerCase() !== hash.toLowerCase()) throw new Error('RPC returned a different transaction hash');
+        acceptedUrl = url;
+        break;
+      } catch (error) {
+        errors.push(`${new URL(url).hostname}: ${error instanceof Error ? error.message : String(error)}`.slice(0, 220));
+      }
+    }
+    if (!acceptedUrl) throw new Error(`Shield could not be broadcast through the configured RPCs. ${errors.join(' | ')}`);
+    input.onSubmitted?.(hash);
+    return waitForTransactionReceipt({ hash, config: input.config, provider, acceptedRpcUrl: acceptedUrl });
+  };
   if (input.asset.kind === 'native') {
     if (!gateway) throw new Error('Native gateway is not configured');
-    const transaction = await gateway.shieldNative(
+    const populated = await gateway.shieldNative.populateTransaction(
       ethers.toBeHex(commitment, 32), ciphertext,
       ethers.toBeHex(note.owner, 32), ethers.toBeHex(note.randomness, 32),
       { value: input.grossAmount },
     );
-    return transaction.wait();
+    return signAndBroadcast(populated, await estimateGas(populated));
   }
+  input.onStage?.('approving');
   const account = await input.signer.getAddress();
   const allowance = await token.allowance(account, input.asset.vault);
   if (allowance < input.grossAmount) await (await token.approve(input.asset.vault, input.grossAmount)).wait();
-  const transaction = await vault.shield(
+  const populated = await vault.shield.populateTransaction(
     input.asset.token, input.grossAmount, ethers.toBeHex(commitment, 32), ciphertext,
     ethers.toBeHex(note.owner, 32), ethers.toBeHex(note.randomness, 32),
   );
-  return transaction.wait();
+  return signAndBroadcast(populated, await estimateGas(populated));
 }
 
 export function poiClientFor(config: NetworkConfig, asset: AssetConfig): POINodeClient | undefined {
@@ -402,11 +669,12 @@ export function ciphertextHash(ciphertexts: [string, string, string, string]): b
 }
 
 function poiProvingAssets() {
-  return { wasm: './proving/swirl_poi.wasm', zkey: './proving/swirl_poi_final.zkey' };
+  return getPoiProvingAssets();
 }
 
 type PrivateTransferInput = {
   signer: Signer; config: NetworkConfig; asset: AssetConfig; wallet: SwirlWallet; synced: SyncedNotes; recipient: string; amount: bigint; directSubmission: boolean;
+  onSubmitted?: (hash: string) => void;
 };
 type BuiltProof = { payload: Omit<ProofPayload, 'quoteId'>; inputs: OwnedNote[]; outputs: SwirlNote[] };
 
@@ -432,7 +700,7 @@ async function buildPrivateTransferPayload(
   const encrypted = ciphertexts as [string, string, string, string];
   const proof = await createTransferProof({
     inputs: proofInputs, outputs, zeroInputPath: input.synced.tree.path(0), ciphertextHash: ciphertextHash(encrypted),
-    chainId: BigInt(input.config.chainId), assets: provingAssets(),
+    chainId: BigInt(input.config.chainId), assets: await provingAssets(),
   });
   return {
     payload: {
@@ -469,7 +737,7 @@ async function attachPreTransactionPOI(
       ciphertextHash: ciphertextHash(payload.ciphertexts), publicAmount: BigInt(payload.publicAmount),
       publicRecipient: BigInt(payload.publicRecipient), token: BigInt(input.asset.token), chainId: BigInt(input.config.chainId),
     },
-    assets: poiProvingAssets(),
+    assets: await poiProvingAssets(),
   });
   return { ...payload, preTransactionPOI };
 }
@@ -485,7 +753,6 @@ export async function estimatePrivateTransferRelayFee(
   await prepareRelayProof(
     input.signer, input.config, input.asset,
     async (fee, feeAddress) => (await buildPrivateTransferPayload({
-      // Keep enough headroom for the real dynamic fee during iterative estimation.
       ...input, recipient: input.wallet.address, amount: spendable / 2n, directSubmission: false,
     }, true, fee, feeAddress)).payload,
     (quote) => { feeAmount = BigInt(quote.feeAmount); },
@@ -506,7 +773,7 @@ export async function privateTransfer(input: PrivateTransferInput): Promise<Priv
     : await build(0n, '');
   if (!context) throw new Error('Private transaction context was not created');
   if (relay && input.config.poiNodeUrl) payload = await attachPreTransactionPOI(input, payload, context.inputs, context.outputs);
-  const receipt = await submitProof(input.signer, input.config, input.asset, payload, input.directSubmission);
+  const receipt = await submitProof(input.signer, input.config, input.asset, payload, input.directSubmission, input.onSubmitted);
   return {
     receipt,
     poi: {
@@ -518,6 +785,8 @@ export async function privateTransfer(input: PrivateTransferInput): Promise<Priv
 
 export async function unshieldTokens(input: {
   signer: Signer; config: NetworkConfig; asset: AssetConfig; wallet: SwirlWallet; synced: SyncedNotes; note: OwnedNote; recipient: string; directSubmission: boolean;
+  onStage?: (stage: 'resources' | 'proving' | 'estimating' | 'broadcasting') => void; onSubmitted?: (hash: string) => void;
+  onProgress?: (progress: number) => void;
 }): Promise<PrivateTransactionResult> {
   if (!isNoteSpendable(input.note, Boolean(input.config.poiNodeUrl))) throw new Error('This note is spent or does not have valid PPOI');
   if (!ethers.isAddress(input.recipient)) throw new Error('Invalid public recipient address');
@@ -535,11 +804,14 @@ export async function unshieldTokens(input: {
       : feeNote ? [ethers.hexlify(encryptNote(feeNote, feeAddress)), '0x', '0x', '0x'] : ['0x', '0x', '0x', '0x'];
     const publicRecipient = native ? input.asset.gateway : input.recipient;
     const outputs = feeNote ? [feeNote, empty] : [empty];
+    input.onStage?.('resources');
+    const assets = await provingAssets(input.onProgress);
+    input.onStage?.('proving');
     const proof = await createTransferProof({
       inputs: [{ note: input.note.note, merklePath: input.synced.tree.path(input.note.note.leafIndex), ownerSecret: bytesToBigint(input.wallet.noteSecretKey) }],
       outputs, zeroInputPath: input.synced.tree.path(0), publicAmount,
       ciphertextHash: ciphertextHash(ciphertexts), publicRecipient: BigInt(publicRecipient),
-      chainId: BigInt(input.config.chainId), assets: provingAssets(),
+      chainId: BigInt(input.config.chainId), assets,
     });
     return {
       payload: {
@@ -566,10 +838,15 @@ export async function unshieldTokens(input: {
   if (native) {
     const { gateway } = contracts(input.signer, input.config, input.asset);
     if (!gateway) throw new Error('Native gateway is not configured');
-    const transaction = await gateway.unshieldNative(payload.proof, payload.root, payload.nullifiers, payload.outputCommitments, payload.ciphertexts, payload.publicAmount);
-    receipt = await transaction.wait();
+    const populated = await gateway.unshieldNative.populateTransaction(
+      payload.proof, payload.root, payload.nullifiers, payload.outputCommitments, payload.ciphertexts, payload.publicAmount,
+    );
+    receipt = await submitNativeTransaction({
+      signer: input.signer, config: input.config, populated, action: 'Unshield',
+      onStage: input.onStage, onSubmitted: input.onSubmitted,
+    });
   } else {
-    receipt = await submitProof(input.signer, input.config, input.asset, payload, input.directSubmission);
+    receipt = await submitProof(input.signer, input.config, input.asset, payload, input.directSubmission, input.onSubmitted);
   }
   return {
     receipt,
@@ -580,13 +857,14 @@ export async function unshieldTokens(input: {
   };
 }
 
-export async function publicTransfer(input: { signer: Signer; config: NetworkConfig; asset: AssetConfig; recipient: string; amount: bigint }) {
+export async function publicTransfer(input: { signer: Signer; config: NetworkConfig; asset: AssetConfig; recipient: string; amount: bigint; onSubmitted?: (hash: string) => void }) {
   if (!ethers.isAddress(input.recipient)) throw new Error('Invalid public recipient address');
   if (input.amount <= 0n) throw new Error('Enter an amount greater than zero');
   const transaction = input.asset.kind === 'native'
     ? await input.signer.sendTransaction({ to: input.recipient, value: input.amount })
     : await contracts(input.signer, input.config, input.asset).token.transfer(input.recipient, input.amount);
-  return transaction.wait();
+  input.onSubmitted?.(transaction.hash);
+  return waitForTransactionReceipt({ hash: transaction.hash, config: input.config, provider: input.signer.provider ?? undefined });
 }
 
 export async function mintTestTokens(signer: Signer, config: NetworkConfig, asset: AssetConfig, amount: bigint) {

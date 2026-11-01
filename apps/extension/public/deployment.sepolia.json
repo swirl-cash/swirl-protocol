@@ -2,7 +2,16 @@
   "network": "sepolia",
   "name": "Sepolia Public Beta",
   "chainId": 11155111,
-  "rpcUrl": "https://ethereum-sepolia-rpc.publicnode.com",
+  "rpcUrl": "https://sepolia.gateway.tenderly.co",
+  "rpcFallbackUrls": [
+    "https://ethereum-sepolia-rpc.publicnode.com",
+    "https://ethereum-sepolia-public.nodies.app",
+    "https://public.1rpc.io/sepolia",
+    "https://0xrpc.io/sep",
+    "https://rpc.sepolia.ethpandaops.io"
+  ],
+  "deploymentBlock": 12009502,
+  "indexerUrl": "https://sepolia-api.138.201.139.236.sslip.io/indexer",
   "deployer": "0x51872254046BF76BF71DC941896943293D45624F",
   "treasury": "0x51872254046BF76BF71DC941896943293D45624F",
   "verifier": "0x61d07B172af4F74457791D61Dc505b3574A1E567",

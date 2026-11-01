@@ -5,23 +5,29 @@ export type WalletSettings = {
   hiddenChainIds: number[];
 };
 
-const SETTINGS_KEY = 'swirl.wallet-settings.v1';
-export const DEFAULT_SETTINGS: WalletSettings = { autoLockMinutes: 15, submission: 'relayer', hiddenChainIds: [] };
+const SETTINGS_KEY = 'swirl.wallet-settings.v2';
+const LEGACY_SETTINGS_KEY = 'swirl.wallet-settings.v1';
+export const DEFAULT_SETTINGS: WalletSettings = { autoLockMinutes: 15, submission: 'main', hiddenChainIds: [] };
+
+async function readSettings(key: string): Promise<unknown> {
+  if (typeof chrome !== 'undefined' && chrome.storage?.local) return (await chrome.storage.local.get(key))[key];
+  const value = localStorage.getItem(key);
+  return value ? JSON.parse(value) : undefined;
+}
 
 export async function loadSettings(): Promise<WalletSettings> {
-  let raw: unknown;
-  if (typeof chrome !== 'undefined' && chrome.storage?.local) raw = (await chrome.storage.local.get(SETTINGS_KEY))[SETTINGS_KEY];
-  else {
-    const value = localStorage.getItem(SETTINGS_KEY);
-    raw = value ? JSON.parse(value) : undefined;
-  }
-  if (!raw || typeof raw !== 'object') return DEFAULT_SETTINGS;
-  const value = raw as Partial<WalletSettings>;
-  return {
+  let raw = await readSettings(SETTINGS_KEY);
+  const migrating = raw === undefined || raw === null;
+  if (migrating) raw = await readSettings(LEGACY_SETTINGS_KEY);
+  const value = raw && typeof raw === 'object' ? raw as Partial<WalletSettings> : {};
+  const settings: WalletSettings = {
     autoLockMinutes: [0, 1, 5, 15, 30].includes(value.autoLockMinutes ?? -1) ? value.autoLockMinutes! : 15,
-    submission: ['relayer', 'main', 'gas'].includes(value.submission ?? '') ? value.submission! : 'relayer',
+    // One-time v2 migration: existing Relayer users also start with their own EVM wallet.
+    submission: !migrating && ['relayer', 'main', 'gas'].includes(value.submission ?? '') ? value.submission! : 'main',
     hiddenChainIds: Array.isArray(value.hiddenChainIds) ? value.hiddenChainIds.filter((item): item is number => Number.isSafeInteger(item) && item > 0) : [],
   };
+  if (migrating) await saveSettings(settings);
+  return settings;
 }
 
 export async function saveSettings(settings: WalletSettings): Promise<void> {
